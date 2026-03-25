@@ -51,9 +51,35 @@ async function fetchProtocolSection(date, title) {
   return ''
 }
 
+async function fetchAnforandenByHtml(dokId) {
+  try {
+    // Hämta anförandelistan för att få anforande_id:n
+    const listRes = await fetch(`https://data.riksdagen.se/anforandelista/?rel_dok_id=${dokId}&utformat=json&antal=20`)
+    const listData = await listRes.json()
+    const list = listData?.anforandelista?.anforande ?? []
+    const arr = (Array.isArray(list) ? list : [list]).filter(a => a.anforande_id)
+    if (arr.length === 0) return ''
+
+    // Hämta upp till 5 anföranden parallellt via deras HTML-URL
+    const results = await Promise.allSettled(
+      arr.slice(0, 5).map(async a => {
+        const r = await fetch(`https://data.riksdagen.se/anforande/${a.anforande_id}/html`)
+        const html = await r.text()
+        const text = stripTags(html).trim()
+        return text.length > 50 ? `[${a.talare} (${a.parti})]: ${text.slice(0, 1500)}` : ''
+      })
+    )
+    const combined = results
+      .filter(r => r.status === 'fulfilled' && r.value)
+      .map(r => r.value)
+      .join('\n\n')
+    return combined
+  } catch(e) { console.error('fetchAnforandenByHtml error:', e.message); return '' }
+}
+
 async function fetchDebateText(dokId, date, title) {
   try {
-    // Kör anforandelista-strategierna parallellt
+    // Strategi 1+2: anforandelista med anforandetext (funkar för äldre debatter)
     const [text1, text2] = await Promise.all([
       fetchAnforanden(`https://data.riksdagen.se/anforandelista/?rel_dok_id=${dokId}&utformat=json&antal=20`),
       fetchAnforanden(`https://data.riksdagen.se/anforandelista/?dokid=${dokId}&utformat=json&antal=20`),
@@ -61,12 +87,17 @@ async function fetchDebateText(dokId, date, title) {
     if (text1.length >= 200) { console.log(`anforanden via rel_dok_id (${text1.length} chars)`); return text1.slice(0, 8000) }
     if (text2.length >= 200) { console.log(`anforanden via dokid (${text2.length} chars)`); return text2.slice(0, 8000) }
 
-    // Kör protokoll + interpellationstext parallellt
+    // Strategi 3: protokollsavsnitt + interpellationstext
     const [protText, ipText] = await Promise.all([
       date ? fetchProtocolSection(date, title) : Promise.resolve(''),
       fetch(`https://data.riksdagen.se/dokument/${dokId}.text`).then(r => r.text()).then(stripTags).catch(() => ''),
     ])
     if (protText.length >= 200) return protText.slice(0, 8000)
+
+    // Strategi 4: hämta enskilda anföranden via deras HTML-URL (funkar för nyliga debatter)
+    const htmlText = await fetchAnforandenByHtml(dokId)
+    if (htmlText.length >= 300) { console.log(`anforanden via HTML (${htmlText.length} chars)`); return htmlText.slice(0, 8000) }
+
     if (ipText.length >= 200) { console.log(`Fallback interpellationstext: ${ipText.length} chars`); return ipText.slice(0, 8000) }
   } catch(e) { console.error('fetchDebateText error:', e.message) }
   return ''
