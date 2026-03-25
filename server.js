@@ -53,28 +53,69 @@ async function fetchProtocolSection(date, title) {
 
 async function fetchAnforandenByHtml(dokId) {
   try {
-    // Hämta anförandelistan för att få anforande_id:n
-    const listRes = await fetch(`https://data.riksdagen.se/anforandelista/?rel_dok_id=${dokId}&utformat=json&antal=20`)
-    const listData = await listRes.json()
-    const list = listData?.anforandelista?.anforande ?? []
-    const arr = (Array.isArray(list) ? list : [list]).filter(a => a.anforande_id)
-    if (arr.length === 0) return ''
+    // Prova rel_dok_id och dokid parallellt
+    const [r1, r2] = await Promise.all([
+      fetch(`https://data.riksdagen.se/anforandelista/?rel_dok_id=${dokId}&utformat=json&antal=50`).then(r => r.json()).catch(() => ({})),
+      fetch(`https://data.riksdagen.se/anforandelista/?dokid=${dokId}&utformat=json&antal=50`).then(r => r.json()).catch(() => ({})),
+    ])
+    const merge = new Map()
+    for (const d of [r1, r2]) {
+      const list = d?.anforandelista?.anforande ?? []
+      const arr = Array.isArray(list) ? list : [list]
+      for (const a of arr) {
+        if (a.anforande_url_html) merge.set(a.anforande_url_html, a)
+      }
+    }
+    const uniq = [...merge.values()]
+    if (uniq.length === 0) return ''
 
-    // Hämta upp till 5 anföranden parallellt via deras HTML-URL
+    // Hämta upp till 8 anföranden parallellt via anforande_url_html
     const results = await Promise.allSettled(
-      arr.slice(0, 5).map(async a => {
-        const r = await fetch(`https://data.riksdagen.se/anforande/${a.anforande_id}/html`)
+      uniq.slice(0, 8).map(async a => {
+        const r = await fetch(a.anforande_url_html)
         const html = await r.text()
         const text = stripTags(html).trim()
         return text.length > 50 ? `[${a.talare} (${a.parti})]: ${text.slice(0, 1500)}` : ''
       })
     )
-    const combined = results
-      .filter(r => r.status === 'fulfilled' && r.value)
-      .map(r => r.value)
-      .join('\n\n')
-    return combined
+    return results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value).join('\n\n')
   } catch(e) { console.error('fetchAnforandenByHtml error:', e.message); return '' }
+}
+
+// Söker anföranden via nyckelord från titeln — hittar debatten även om debattdag saknas
+async function fetchAnforandenByTitle(title) {
+  try {
+    const words = (title || '').split(/\s+/).filter(w => w.length > 4).slice(0, 3)
+    if (words.length === 0) return ''
+    // Sök de senaste 3 månaders anföranden om interpellationer
+    const today = new Date()
+    const from = new Date(today); from.setMonth(from.getMonth() - 3)
+    const fromStr = from.toISOString().slice(0,10).replace(/-/g,'')
+    const tomStr = today.toISOString().slice(0,10).replace(/-/g,'')
+    const res = await fetch(
+      `https://data.riksdagen.se/anforandelista/?rm=2025/26&kammaraktivitet=interpellationsdebatt&utformat=json&antal=200&from=${fromStr}&tom=${tomStr}`
+    )
+    const data = await res.json()
+    const list = data?.anforandelista?.anforande ?? []
+    const arr = Array.isArray(list) ? list : [list]
+    // Filtrera på anföranden vars rubrik matchar något av nyckelorden
+    const relevant = arr.filter(a => {
+      const rubrik = (a.avsnittsrubrik || '').toLowerCase()
+      return words.some(w => rubrik.includes(w.toLowerCase()))
+    })
+    if (relevant.length === 0) return ''
+    console.log(`fetchAnforandenByTitle: ${relevant.length} träffar för "${words.join(' ')}"`)
+    const results = await Promise.allSettled(
+      relevant.slice(0, 8).map(async a => {
+        if (!a.anforande_url_html) return ''
+        const r = await fetch(a.anforande_url_html)
+        const html = await r.text()
+        const text = stripTags(html).trim()
+        return text.length > 50 ? `[${a.talare} (${a.parti})]: ${text.slice(0, 1500)}` : ''
+      })
+    )
+    return results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value).join('\n\n')
+  } catch(e) { console.error('fetchAnforandenByTitle error:', e.message); return '' }
 }
 
 async function fetchDebateText(dokId, date, title) {
@@ -94,9 +135,13 @@ async function fetchDebateText(dokId, date, title) {
     ])
     if (protText.length >= 200) return protText.slice(0, 8000)
 
-    // Strategi 4: hämta enskilda anföranden via deras HTML-URL (funkar för nyliga debatter)
+    // Strategi 4: hämta enskilda anföranden via deras HTML-URL
     const htmlText = await fetchAnforandenByHtml(dokId)
     if (htmlText.length >= 300) { console.log(`anforanden via HTML (${htmlText.length} chars)`); return htmlText.slice(0, 8000) }
+
+    // Strategi 5: sök anföranden via nyckelord från titeln (hittar debatten när debattdag saknas)
+    const titleText = await fetchAnforandenByTitle(title)
+    if (titleText.length >= 300) { console.log(`anforanden via titel (${titleText.length} chars)`); return titleText.slice(0, 8000) }
 
     if (ipText.length >= 200) { console.log(`Fallback interpellationstext: ${ipText.length} chars`); return ipText.slice(0, 8000) }
   } catch(e) { console.error('fetchDebateText error:', e.message) }
