@@ -623,7 +623,18 @@ app.post('/ai', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, summaries: summaryCache.size }))
+app.get('/health', (_, res) => res.json({ ok: true, summaries: summaryCache.size, dbReady, hasUrl: !!process.env.DATABASE_URL }))
+
+app.get('/debug/db', requireAdmin, async (req, res) => {
+  const urlSnip = (process.env.DATABASE_URL || '').slice(0, 40) + '...'
+  try {
+    await pool.query('SELECT 1')
+    res.json({ ok: true, urlSnip })
+  } catch(e) {
+    const msg = e?.errors?.[0]?.message || e?.message || String(e)
+    res.json({ ok: false, urlSnip, error: msg })
+  }
+})
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 
