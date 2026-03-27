@@ -627,12 +627,22 @@ app.get('/health', (_, res) => res.json({ ok: true, summaries: summaryCache.size
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 
+let dbReady = false
+
 async function start() {
-  await initDb()
-  buildVotesCache()
-  runAutoFetch()
-  setInterval(runAutoFetch, 60 * 60 * 1000) // every hour
+  // Start server immediately so Railway health checks pass
   app.listen(PORT, () => console.log(`Civica backend on port ${PORT}`))
+
+  // Connect to DB (may not be available yet)
+  try {
+    await initDb()
+    dbReady = true
+    buildVotesCache()
+    runAutoFetch()
+    setInterval(runAutoFetch, 60 * 60 * 1000)
+  } catch(e) {
+    console.error('DB not available, running without CMS:', e.message)
+  }
 }
 
-start().catch(e => { console.error('Startup error:', e); process.exit(1) })
+start()
