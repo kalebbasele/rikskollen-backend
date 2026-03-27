@@ -400,7 +400,7 @@ async function runAutoFetch() {
 
   // 2. Votes
   try {
-    const listRes = await fetchWithTimeout('https://data.riksdagen.se/voteringlista/?sz=8&utformat=json&gruppering=votering_id')
+    const listRes = await fetchWithTimeout('https://data.riksdagen.se/voteringlista/?sz=8&utformat=json&gruppering=votering_id&sort=datum&sortorder=desc')
     const listData = await listRes.json()
     const items = listData?.voteringlista?.votering ?? []
     const arr = (Array.isArray(items) ? items : [items]).slice(0, 6)
