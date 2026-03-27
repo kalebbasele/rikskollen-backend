@@ -1,17 +1,101 @@
 import express from 'express'
 import cors from 'cors'
 import fetch from 'node-fetch'
+import pg from 'pg'
 
+const { Pool } = pg
 const app = express()
 const PORT = process.env.PORT || 3001
 app.use(cors())
 app.use(express.json({ limit: '2mb' }))
 
-const summaryCache = new Map()
+// ── Database ──────────────────────────────────────────────────────────────────
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+})
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS debates (
+      id TEXT PRIMARY KEY,
+      dok_id TEXT UNIQUE,
+      title TEXT,
+      topic TEXT,
+      topic_emoji TEXT,
+      date TEXT,
+      venue TEXT,
+      participants JSONB,
+      ingress TEXT,
+      left_bloc JSONB,
+      right_bloc JSONB,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      approved_at TIMESTAMPTZ
+    );
+    CREATE TABLE IF NOT EXISTS votes (
+      id TEXT PRIMARY KEY,
+      title TEXT,
+      human_title TEXT,
+      topic_emoji TEXT,
+      date TEXT,
+      total_ja INTEGER,
+      total_nej INTEGER,
+      total_avstar INTEGER,
+      total_franvarande INTEGER,
+      party_votes JSONB,
+      dok_id TEXT,
+      outcome TEXT,
+      ja_meaning TEXT,
+      nej_meaning TEXT,
+      consequence TEXT,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      approved_at TIMESTAMPTZ
+    );
+  `)
+  console.log('DB: tables ready')
+}
+
+// ── Auth middleware ───────────────────────────────────────────────────────────
+
+function requireAdmin(req, res, next) {
+  const key = req.headers['x-admin-key']
+  if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+  next()
+}
+
+// ── Text helpers ──────────────────────────────────────────────────────────────
 
 function stripTags(s) {
   return (s ?? '').replace(/<[^>]*>/g, ' ').replace(/&[a-z#0-9]+;/gi, ' ').replace(/\s+/g, ' ').trim()
 }
+
+function cleanName(raw) {
+  return (raw ?? '')
+    .replace(/\s*\([^)]+\)\s*$/, '')
+    .replace(/^.*minister\s+/i, '')
+    .replace(/^Statssekreterare\s+/i, '')
+    .replace(/^Talman\s+/i, '')
+    .trim()
+}
+
+function personPhotoUrl(id) {
+  return `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_max.jpg`
+}
+
+function fetchWithTimeout(url, ms = 6000) {
+  const ctrl = new AbortController()
+  const id = setTimeout(() => ctrl.abort(), ms)
+  return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(id))
+}
+
+// ── Riksdagen speech fetchers ─────────────────────────────────────────────────
+
+const summaryCache = new Map()
 
 async function fetchAnforanden(url) {
   try {
@@ -23,37 +107,8 @@ async function fetchAnforanden(url) {
   } catch { return '' }
 }
 
-async function fetchProtocolSection(date, title) {
-  try {
-    const dateStr = date.replace(/-/g, '')
-    const protRes = await fetch(`https://data.riksdagen.se/dokumentlista/?doktyp=prot&from=${dateStr}&tom=${dateStr}&utformat=json&antal=20`)
-    const protData = await protRes.json()
-    const protDocs = protData?.dokumentlista?.dokument ?? []
-    const protArr = Array.isArray(protDocs) ? protDocs : [protDocs]
-    // Filtrera på exakt debattdatum
-    const matching = protArr.filter(p => p.datum === date)
-    const candidates = matching.length > 0 ? matching : protArr.slice(0, 1)
-    const searchWord = (title || '').split(' ').find(w => w.length > 4) || 'interpellation'
-    for (const prot of candidates) {
-      const res = await fetch(`https://data.riksdagen.se/dokument/${prot.dok_id}.text`)
-      const raw = await res.text()
-      const clean = stripTags(raw)
-      const match = clean.search(new RegExp(searchWord, 'i'))
-      if (match >= 0) {
-        const section = clean.slice(Math.max(0, match - 300), match + 7000)
-        if (section.length >= 200) {
-          console.log(`Hittade protokollsavsnitt i ${prot.dok_id} (${section.length} chars)`)
-          return section
-        }
-      }
-    }
-  } catch(e) { console.error('fetchProtocolSection error:', e.message) }
-  return ''
-}
-
 async function fetchAnforandenByHtml(dokId) {
   try {
-    // Prova rel_dok_id och dokid parallellt
     const [r1, r2] = await Promise.all([
       fetch(`https://data.riksdagen.se/anforandelista/?rel_dok_id=${dokId}&utformat=json&antal=50`).then(r => r.json()).catch(() => ({})),
       fetch(`https://data.riksdagen.se/anforandelista/?dokid=${dokId}&utformat=json&antal=50`).then(r => r.json()).catch(() => ({})),
@@ -62,14 +117,10 @@ async function fetchAnforandenByHtml(dokId) {
     for (const d of [r1, r2]) {
       const list = d?.anforandelista?.anforande ?? []
       const arr = Array.isArray(list) ? list : [list]
-      for (const a of arr) {
-        if (a.anforande_url_html) merge.set(a.anforande_url_html, a)
-      }
+      for (const a of arr) { if (a.anforande_url_html) merge.set(a.anforande_url_html, a) }
     }
     const uniq = [...merge.values()]
     if (uniq.length === 0) return ''
-
-    // Hämta upp till 8 anföranden parallellt via anforande_url_html
     const results = await Promise.allSettled(
       uniq.slice(0, 8).map(async a => {
         const r = await fetch(a.anforande_url_html)
@@ -79,185 +130,509 @@ async function fetchAnforandenByHtml(dokId) {
       })
     )
     return results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value).join('\n\n')
-  } catch(e) { console.error('fetchAnforandenByHtml error:', e.message); return '' }
+  } catch { return '' }
 }
 
-// Söker anföranden via nyckelord från titeln — hittar debatten även om debattdag saknas
-async function fetchAnforandenByTitle(title) {
+async function fetchProtocolSection(date, title) {
   try {
-    const words = (title || '').split(/\s+/).filter(w => w.length > 4).slice(0, 3)
-    if (words.length === 0) return ''
-    // Sök de senaste 3 månaders anföranden om interpellationer
-    const today = new Date()
-    const from = new Date(today); from.setMonth(from.getMonth() - 3)
-    const fromStr = from.toISOString().slice(0,10).replace(/-/g,'')
-    const tomStr = today.toISOString().slice(0,10).replace(/-/g,'')
-    const res = await fetch(
-      `https://data.riksdagen.se/anforandelista/?rm=2025/26&kammaraktivitet=interpellationsdebatt&utformat=json&antal=200&from=${fromStr}&tom=${tomStr}`
-    )
-    const data = await res.json()
-    const list = data?.anforandelista?.anforande ?? []
-    const arr = Array.isArray(list) ? list : [list]
-    // Filtrera på anföranden vars rubrik matchar något av nyckelorden
-    const relevant = arr.filter(a => {
-      const rubrik = (a.avsnittsrubrik || '').toLowerCase()
-      return words.some(w => rubrik.includes(w.toLowerCase()))
-    })
-    if (relevant.length === 0) return ''
-    console.log(`fetchAnforandenByTitle: ${relevant.length} träffar för "${words.join(' ')}"`)
-    const results = await Promise.allSettled(
-      relevant.slice(0, 8).map(async a => {
-        if (!a.anforande_url_html) return ''
-        const r = await fetch(a.anforande_url_html)
-        const html = await r.text()
-        const text = stripTags(html).trim()
-        return text.length > 50 ? `[${a.talare} (${a.parti})]: ${text.slice(0, 1500)}` : ''
-      })
-    )
-    return results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value).join('\n\n')
-  } catch(e) { console.error('fetchAnforandenByTitle error:', e.message); return '' }
+    const dateStr = date.replace(/-/g, '')
+    const protRes = await fetch(`https://data.riksdagen.se/dokumentlista/?doktyp=prot&from=${dateStr}&tom=${dateStr}&utformat=json&antal=20`)
+    const protData = await protRes.json()
+    const protDocs = protData?.dokumentlista?.dokument ?? []
+    const protArr = Array.isArray(protDocs) ? protDocs : [protDocs]
+    const matching = protArr.filter(p => p.datum === date)
+    const candidates = matching.length > 0 ? matching : protArr.slice(0, 1)
+    const searchWord = (title || '').split(' ').find(w => w.length > 4) || 'interpellation'
+    for (const prot of candidates) {
+      const res = await fetch(`https://data.riksdagen.se/dokument/${prot.dok_id}.text`)
+      const raw = await res.text()
+      const clean = stripTags(raw)
+      const match = clean.search(new RegExp(searchWord, 'i'))
+      if (match >= 0) {
+        const section = clean.slice(Math.max(0, match - 300), match + 15000)
+        if (section.length >= 200) return section
+      }
+    }
+  } catch {}
+  return ''
 }
 
 async function fetchDebateText(dokId, date, title) {
   try {
-    // Strategi 1+2: anforandelista med anforandetext (funkar för äldre debatter)
-    const [text1, text2] = await Promise.all([
+    const results = await Promise.allSettled([
       fetchAnforanden(`https://data.riksdagen.se/anforandelista/?rel_dok_id=${dokId}&utformat=json&antal=20`),
       fetchAnforanden(`https://data.riksdagen.se/anforandelista/?dokid=${dokId}&utformat=json&antal=20`),
-    ])
-    if (text1.length >= 200) { console.log(`anforanden via rel_dok_id (${text1.length} chars)`); return text1.slice(0, 8000) }
-    if (text2.length >= 200) { console.log(`anforanden via dokid (${text2.length} chars)`); return text2.slice(0, 8000) }
-
-    // Strategi 3: protokollsavsnitt + interpellationstext
-    const [protText, ipText] = await Promise.all([
+      fetchAnforandenByHtml(dokId),
       date ? fetchProtocolSection(date, title) : Promise.resolve(''),
       fetch(`https://data.riksdagen.se/dokument/${dokId}.text`).then(r => r.text()).then(stripTags).catch(() => ''),
     ])
-    if (protText.length >= 200) return protText.slice(0, 8000)
-
-    // Strategi 4: hämta enskilda anföranden via deras HTML-URL
-    const htmlText = await fetchAnforandenByHtml(dokId)
-    if (htmlText.length >= 300) { console.log(`anforanden via HTML (${htmlText.length} chars)`); return htmlText.slice(0, 8000) }
-
-    // Strategi 5: sök anföranden via nyckelord från titeln (hittar debatten när debattdag saknas)
-    const titleText = await fetchAnforandenByTitle(title)
-    if (titleText.length >= 300) { console.log(`anforanden via titel (${titleText.length} chars)`); return titleText.slice(0, 8000) }
-
-    if (ipText.length >= 200) { console.log(`Fallback interpellationstext: ${ipText.length} chars`); return ipText.slice(0, 8000) }
-  } catch(e) { console.error('fetchDebateText error:', e.message) }
+    const texts = results.map(r => r.status === 'fulfilled' ? r.value : '')
+    const best = texts.filter(t => t.length >= 200).sort((a, b) => b.length - a.length)[0]
+    if (best) return best.slice(0, 8000)
+  } catch {}
   return ''
 }
 
 async function generateAndCache(dokId, title, date, apiKey) {
   if (summaryCache.has(dokId)) return summaryCache.get(dokId)
   const protocol = await fetchDebateText(dokId, date, title)
-  console.log(`fetchDebateText(${dokId}) => ${protocol.length} chars`)
   if (!protocol || protocol.length < 100) return null
   const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: {'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},
+    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1200,
-      messages: [{role:'user',content:`Du är en politisk journalist. Sammanfatta denna riksdagsdebatt för unga väljare. Basera ENBART på texten nedan.\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON:\n{"ingress":"2-3 meningar.","vansterblocket":{"parties":["S"],"summary":"Vad de argumenterade för.","keyArg":"Starkaste argument."},"hogerblocket":{"parties":["M"],"summary":"Vad de argumenterade för.","keyArg":"Starkaste argument."}}`}]
+      max_tokens: 700,
+      messages: [{ role: 'user', content: `Du är en politisk journalist. Sammanfatta denna riksdagsdebatt för unga väljare. Basera ENBART på texten nedan.\n\nKontext: I Sverige 2025/26 är regeringspartierna M, KD, L, C, SD = högerblocket. Oppositionspartierna S, MP, V = vänsterblocket.\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON:\n{"ingress":"2-3 meningar om vad debatten handlade om.","vansterblocket":{"parties":["faktiska vänsterpartier som talade"],"summary":"Vad de argumenterade för, 2-4 meningar.","keyArg":"Deras starkaste argument, 1 mening."},"hogerblocket":{"parties":["faktiska högerpartier/ministern som talade"],"summary":"Vad ministern/högerblocket argumenterade för, 2-4 meningar.","keyArg":"Deras starkaste argument, 1 mening."}}` }]
     })
   })
   const aiData = await aiRes.json()
   const text = aiData.content?.[0]?.text ?? ''
-  const result = JSON.parse(text.replace(/```json|```/g,'').trim())
+  const result = JSON.parse(text.replace(/```json|```/g, '').trim())
   summaryCache.set(dokId, result)
   return result
 }
 
-// ── Votes cache ──────────────────────────────────────────────────────────────
-const votesCache = { data: null, ts: 0 }
-const VOTES_TTL = 5 * 60 * 1000
+// ── Vote helpers ──────────────────────────────────────────────────────────────
 
-app.get('/votes', async (req, res) => {
-  if (votesCache.data && Date.now() - votesCache.ts < VOTES_TTL) {
-    return res.json(votesCache.data)
+async function parseVoteDetail(id) {
+  const r = await fetchWithTimeout(`https://data.riksdagen.se/votering/${id}/json`)
+  const d = await r.json()
+  const doc = d?.votering?.dokument ?? {}
+  const voteRows = d?.votering?.dokvotering?.votering ?? []
+  const vArr = Array.isArray(voteRows) ? voteRows : [voteRows]
+  const partyMap = {}
+  for (const v of vArr) {
+    const party = v.parti ?? 'Okänt'
+    if (!partyMap[party]) partyMap[party] = { party, ja: 0, nej: 0, avstar: 0, franvarande: 0 }
+    const rost = (v.rost ?? '').toLowerCase()
+    if (rost === 'ja') partyMap[party].ja++
+    else if (rost === 'nej') partyMap[party].nej++
+    else if (rost === 'avstår') partyMap[party].avstar++
+    else partyMap[party].franvarande++
   }
+  const firstVote = vArr[0] ?? {}
+  const punkt = firstVote.punkt ?? ''
+  return {
+    title: doc.titel ? `${doc.titel}${punkt ? ` (punkt ${punkt})` : ''}` : (firstVote.beteckning || id),
+    date: (doc.datum ?? firstVote.datum ?? '').slice(0, 10),
+    partyVotes: Object.values(partyMap).filter(p => p.party !== '-').sort((a, b) => b.ja - a.ja),
+    dokId: doc.dok_id ?? firstVote.dok_id ?? null,
+  }
+}
+
+async function generateVoteSummaryServer(vote, apiKey) {
+  const partyBreakdown = (vote.partyVotes || []).map(pv => `${pv.party}: ${pv.ja} ja, ${pv.nej} nej`).join('\n')
+  const prompt = `Du är en politisk journalist som förklarar riksdagsbeslut konkret för unga svenska väljare.
+
+Omröstning: ${vote.title}
+Datum: ${vote.date}
+Resultat: ${vote.totalJa} ja, ${vote.totalNej} nej → ${vote.outcome === 'ja' ? 'BIFALLEN' : 'AVSLAGEN'}
+
+Partier:
+${partyBreakdown}
+
+Svara ENDAST med JSON:
+{"humanTitle":"[Kort fråga max 8 ord]","jaMeaning":"[Vad JA innebär konkret, en mening]","nejMeaning":"[Vad NEJ innebär konkret, en mening]","consequence":"[Vad utfallet betyder för vanliga människor, 1-2 meningar]","topicEmoji":"[ett emoji]"}`
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 400, messages: [{ role: 'user', content: prompt }] })
+  })
+  const data = await res.json()
+  const text = data.content?.[0]?.text ?? ''
+  return JSON.parse(text.replace(/```json|```/g, '').trim())
+}
+
+// ── Riksdagen debate parser (ported from frontend) ────────────────────────────
+
+async function fetchDebatesFromRiksdagen() {
+  const res = await fetch('https://data.riksdagen.se/dokumentlista/?doktyp=ip&utformat=json&antal=30&sort=debattdag&sortorder=desc')
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const data = await res.json()
+  const rawDok = data?.dokumentlista?.dokument ?? []
+  const dokument = Array.isArray(rawDok) ? rawDok : [rawDok]
+  const debates = []
+
+  for (const dok of dokument) {
+    if (debates.length >= 20) break
+    if (!dok.debatt) continue
+
+    const intressenter = (() => { const i = dok.dokintressent?.intressent; if (!i) return []; return Array.isArray(i) ? i : [i] })()
+    const anforanden = (() => { const a = dok.debatt?.anforande; if (!a) return []; return Array.isArray(a) ? a : [a] })()
+
+    const anforMap = new Map()
+    for (const a of anforanden) {
+      if (a.intressent_id && !anforMap.has(a.intressent_id)) {
+        anforMap.set(a.intressent_id, { name: cleanName(a.talare ?? ''), party: a.parti || a.partibet || '' })
+      }
+    }
+
+    const makeParticipant = (i, role) => {
+      const id = i.intressent_id ?? ''
+      const fromAnf = anforMap.get(id)
+      const name = fromAnf?.name || cleanName(i.namn ?? 'Okänd')
+      const party = i.partibet || i.parti || fromAnf?.party || ''
+      return { person: { id, name, firstName: name.split(' ')[0], lastName: name.split(' ').slice(1).join(' '), party, photoUrl: personPhotoUrl(id) }, role }
+    }
+
+    const seen = new Set()
+    const participants = []
+
+    const undertecknare = intressenter.find(i => i.roll === 'undertecknare')
+    if (undertecknare?.intressent_id) { seen.add(undertecknare.intressent_id); participants.push(makeParticipant(undertecknare, 'undertecknare')) }
+
+    const besvaradav = intressenter.find(i => i.roll === 'besvaradav')
+    if (besvaradav?.intressent_id && !seen.has(besvaradav.intressent_id)) { seen.add(besvaradav.intressent_id); participants.push(makeParticipant(besvaradav, 'besvaradav')) }
+
+    for (const a of anforanden) {
+      const id = a.intressent_id
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      const fromDok = intressenter.find(i => i.intressent_id === id)
+      if (fromDok) {
+        participants.push(makeParticipant(fromDok, 'talare'))
+      } else {
+        const name = cleanName(a.talare ?? 'Okänd')
+        participants.push({ person: { id, name, firstName: name.split(' ')[0], lastName: name.split(' ').slice(1).join(' '), party: a.parti || a.partibet || '', photoUrl: personPhotoUrl(id) }, role: 'talare' })
+      }
+    }
+
+    if (participants.length === 0) continue
+
+    const seenNames = new Set()
+    const uniqueParticipants = participants.filter(p => {
+      const key = p.person.name.toLowerCase().trim()
+      if (seenNames.has(key)) return false
+      seenNames.add(key)
+      return true
+    })
+
+    const debattdag = dok.debattdag || anforanden[0]?.anf_datumtid?.slice(0, 10) || dok.datum || ''
+    debates.push({
+      id: dok.dok_id,
+      dokId: dok.dok_id,
+      title: dok.titel ?? 'Debatt',
+      topic: dok.debattnamn ?? 'Interpellationsdebatt',
+      topicEmoji: '',
+      date: debattdag,
+      venue: 'Riksdagens kammare',
+      participants: uniqueParticipants,
+    })
+  }
+  return debates.sort((a, b) => b.date > a.date ? 1 : -1)
+}
+
+// ── DB mappers ────────────────────────────────────────────────────────────────
+
+function dbDebateToFrontend(row) {
+  return {
+    id: row.id,
+    dokId: row.dok_id,
+    title: row.title,
+    topic: row.topic,
+    topicEmoji: row.topic_emoji || '',
+    date: row.date,
+    venue: row.venue,
+    participants: row.participants || [],
+    ingress: row.ingress,
+    leftBloc: row.left_bloc,
+    rightBloc: row.right_bloc,
+  }
+}
+
+function dbVoteToFrontend(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    humanTitle: row.human_title,
+    topicEmoji: row.topic_emoji || '',
+    date: row.date,
+    totalJa: row.total_ja,
+    totalNej: row.total_nej,
+    totalAvstar: row.total_avstar,
+    totalFranvarande: row.total_franvarande,
+    partyVotes: row.party_votes || [],
+    dokId: row.dok_id,
+    outcome: row.outcome,
+    jaMeaning: row.ja_meaning,
+    nejMeaning: row.nej_meaning,
+    consequence: row.consequence,
+  }
+}
+
+// ── Auto-fetch job ────────────────────────────────────────────────────────────
+
+async function runAutoFetch() {
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  if (!apiKey) { console.log('Auto-fetch: no ANTHROPIC_API_KEY, skipping'); return }
+  console.log('Auto-fetch: starting...')
+
+  // 1. Debates
   try {
-    const listRes = await fetch('https://data.riksdagen.se/voteringlista/?sz=20&utformat=json&gruppering=votering_id')
+    const debates = await fetchDebatesFromRiksdagen()
+    for (const debate of debates) {
+      const existing = await pool.query('SELECT id FROM debates WHERE id = $1', [debate.id])
+      if (existing.rows.length > 0) continue
+
+      let ingress = null, leftBloc = null, rightBloc = null
+      try {
+        const summary = await generateAndCache(debate.dokId, debate.title, debate.date, apiKey)
+        if (summary) {
+          ingress = summary.ingress
+          leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+          rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+        }
+      } catch(e) { console.error(`AI debate failed ${debate.id}:`, e.message) }
+
+      await pool.query(
+        `INSERT INTO debates (id, dok_id, title, topic, topic_emoji, date, venue, participants, ingress, left_bloc, right_bloc, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending') ON CONFLICT (id) DO NOTHING`,
+        [debate.id, debate.dokId, debate.title, debate.topic, debate.topicEmoji, debate.date, debate.venue,
+         JSON.stringify(debate.participants), ingress,
+         leftBloc ? JSON.stringify(leftBloc) : null,
+         rightBloc ? JSON.stringify(rightBloc) : null]
+      )
+      console.log(`Auto-fetch: saved debate "${debate.title}"`)
+    }
+  } catch(e) { console.error('Auto-fetch debates error:', e.message) }
+
+  // 2. Votes
+  try {
+    const listRes = await fetchWithTimeout('https://data.riksdagen.se/voteringlista/?sz=8&utformat=json&gruppering=votering_id')
     const listData = await listRes.json()
     const items = listData?.voteringlista?.votering ?? []
-    const arr = Array.isArray(items) ? items : [items]
+    const arr = (Array.isArray(items) ? items : [items]).slice(0, 6)
 
-    const details = await Promise.allSettled(arr.slice(0, 10).map(async item => {
-      const r = await fetch(`https://data.riksdagen.se/votering/${item.votering_id}/json`)
-      const d = await r.json()
-      const doc = d?.votering?.dokument ?? {}
-      const voteRows = d?.votering?.dokvotering?.votering ?? []
-      const vArr = Array.isArray(voteRows) ? voteRows : [voteRows]
-      const partyMap = {}
-      for (const v of vArr) {
-        const party = v.parti ?? 'Okänt'
-        if (!partyMap[party]) partyMap[party] = { party, ja: 0, nej: 0, avstar: 0, franvarande: 0 }
-        const rost = (v.rost ?? '').toLowerCase()
-        if (rost === 'ja') partyMap[party].ja++
-        else if (rost === 'nej') partyMap[party].nej++
-        else if (rost === 'avstår') partyMap[party].avstar++
-        else partyMap[party].franvarande++
-      }
-      const firstVote = vArr[0] ?? {}
-      const punkt = firstVote.punkt ?? ''
-      const title = doc.titel ? `${doc.titel}${punkt ? ` (punkt ${punkt})` : ''}` : (firstVote.beteckning ?? 'Omröstning')
-      return {
-        id: item.votering_id, title,
-        date: (doc.datum ?? firstVote.datum ?? '').slice(0, 10),
+    for (const item of arr) {
+      const existing = await pool.query('SELECT id FROM votes WHERE id = $1', [item.votering_id])
+      if (existing.rows.length > 0) continue
+
+      let title = item.beteckning || item.votering_id
+      let date = (item.datum || '').slice(0, 10)
+      let partyVotes = []
+      let dokId = null
+
+      try {
+        const detail = await parseVoteDetail(item.votering_id)
+        title = detail.title || title
+        date = detail.date || date
+        partyVotes = detail.partyVotes
+        dokId = detail.dokId
+      } catch(e) { console.error(`Vote detail failed ${item.votering_id}:`, e.message) }
+
+      const baseVote = {
+        id: item.votering_id, title, date,
         totalJa: parseInt(item.Ja) || 0,
         totalNej: parseInt(item.Nej) || 0,
         totalAvstar: parseInt(item['Avstår']) || 0,
         totalFranvarande: parseInt(item['Frånvarande']) || 0,
-        partyVotes: Object.values(partyMap).filter(p => p.party !== '-').sort((a, b) => b.ja - a.ja),
-        dokId: doc.dok_id ?? firstVote.dok_id,
         outcome: (parseInt(item.Ja) || 0) >= (parseInt(item.Nej) || 0) ? 'ja' : 'nej',
+        partyVotes, dokId,
       }
-    }))
 
-    const votes = details.filter(r => r.status === 'fulfilled').map(r => r.value)
+      let humanTitle = null, jaMeaning = null, nejMeaning = null, consequence = null, topicEmoji = null
+      try {
+        const s = await generateVoteSummaryServer(baseVote, apiKey)
+        if (s) { humanTitle = s.humanTitle; jaMeaning = s.jaMeaning; nejMeaning = s.nejMeaning; consequence = s.consequence; topicEmoji = s.topicEmoji }
+      } catch(e) { console.error(`Vote AI failed ${item.votering_id}:`, e.message) }
+
+      await pool.query(
+        `INSERT INTO votes (id, title, human_title, topic_emoji, date, total_ja, total_nej, total_avstar, total_franvarande, party_votes, dok_id, outcome, ja_meaning, nej_meaning, consequence, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pending') ON CONFLICT (id) DO NOTHING`,
+        [baseVote.id, baseVote.title, humanTitle, topicEmoji, baseVote.date,
+         baseVote.totalJa, baseVote.totalNej, baseVote.totalAvstar, baseVote.totalFranvarande,
+         JSON.stringify(baseVote.partyVotes), baseVote.dokId, baseVote.outcome,
+         jaMeaning, nejMeaning, consequence]
+      )
+      console.log(`Auto-fetch: saved vote "${title}"`)
+    }
+  } catch(e) { console.error('Auto-fetch votes error:', e.message) }
+
+  console.log('Auto-fetch: done')
+}
+
+// ── Public endpoints ──────────────────────────────────────────────────────────
+
+app.get('/api/public/debates', async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM debates WHERE status = 'approved' ORDER BY date DESC")
+    res.json(rows.map(dbDebateToFrontend))
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/public/votes', async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM votes WHERE status = 'approved' ORDER BY date DESC")
+    res.json(rows.map(dbVoteToFrontend))
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// ── Admin endpoints ───────────────────────────────────────────────────────────
+
+app.get('/admin/debates', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM debates ORDER BY created_at DESC')
+    res.json(rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/admin/votes', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM votes ORDER BY created_at DESC')
+    res.json(rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.patch('/admin/debates/:id', requireAdmin, async (req, res) => {
+  const { title, ingress, left_bloc, right_bloc, participants, topic_emoji } = req.body
+  try {
+    await pool.query(
+      `UPDATE debates SET
+        title = COALESCE($1, title),
+        ingress = COALESCE($2, ingress),
+        left_bloc = COALESCE($3::jsonb, left_bloc),
+        right_bloc = COALESCE($4::jsonb, right_bloc),
+        participants = COALESCE($5::jsonb, participants),
+        topic_emoji = COALESCE($6, topic_emoji)
+       WHERE id = $7`,
+      [title ?? null, ingress ?? null,
+       left_bloc ? JSON.stringify(left_bloc) : null,
+       right_bloc ? JSON.stringify(right_bloc) : null,
+       participants ? JSON.stringify(participants) : null,
+       topic_emoji ?? null, req.params.id]
+    )
+    const { rows } = await pool.query('SELECT * FROM debates WHERE id = $1', [req.params.id])
+    res.json(rows[0])
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.patch('/admin/votes/:id', requireAdmin, async (req, res) => {
+  const { human_title, ja_meaning, nej_meaning, consequence, topic_emoji } = req.body
+  try {
+    await pool.query(
+      `UPDATE votes SET
+        human_title = COALESCE($1, human_title),
+        ja_meaning = COALESCE($2, ja_meaning),
+        nej_meaning = COALESCE($3, nej_meaning),
+        consequence = COALESCE($4, consequence),
+        topic_emoji = COALESCE($5, topic_emoji)
+       WHERE id = $6`,
+      [human_title ?? null, ja_meaning ?? null, nej_meaning ?? null, consequence ?? null, topic_emoji ?? null, req.params.id]
+    )
+    const { rows } = await pool.query('SELECT * FROM votes WHERE id = $1', [req.params.id])
+    res.json(rows[0])
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/admin/debates/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("UPDATE debates SET status = 'approved', approved_at = NOW() WHERE id = $1", [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/admin/votes/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("UPDATE votes SET status = 'approved', approved_at = NOW() WHERE id = $1", [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.delete('/admin/debates/:id', requireAdmin, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM debates WHERE id = $1', [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.delete('/admin/votes/:id', requireAdmin, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM votes WHERE id = $1', [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// ── Existing endpoints (kept) ─────────────────────────────────────────────────
+
+const votesCache = { data: null, ts: 0, building: false }
+const VOTES_TTL = 8 * 60 * 60 * 1000
+
+async function buildVotesCache() {
+  if (votesCache.building) return
+  votesCache.building = true
+  try {
+    const listRes = await fetchWithTimeout('https://data.riksdagen.se/voteringlista/?sz=8&utformat=json&gruppering=votering_id')
+    const listData = await listRes.json()
+    const items = listData?.voteringlista?.votering ?? []
+    const arr = (Array.isArray(items) ? items : [items]).slice(0, 6)
+    const details = await Promise.allSettled(arr.map(item => parseVoteDetail(item.votering_id)))
+    const votes = arr.map((item, i) => {
+      const base = { id: item.votering_id, totalJa: parseInt(item.Ja) || 0, totalNej: parseInt(item.Nej) || 0, totalAvstar: parseInt(item['Avstår']) || 0, totalFranvarande: parseInt(item['Frånvarande']) || 0, outcome: (parseInt(item.Ja) || 0) >= (parseInt(item.Nej) || 0) ? 'ja' : 'nej' }
+      if (details[i].status === 'fulfilled') return { ...base, ...details[i].value }
+      return { ...base, title: item.beteckning || item.votering_id, date: '', partyVotes: [], dokId: null }
+    })
     votesCache.data = votes
     votesCache.ts = Date.now()
-    res.json(votes)
-  } catch(e) { res.status(500).json({ error: e.message }) }
+  } catch(e) { console.error('buildVotesCache:', e.message) } finally { votesCache.building = false }
+}
+
+app.get('/votes', async (req, res) => {
+  if (votesCache.data) {
+    res.json(votesCache.data)
+    if (Date.now() - votesCache.ts > VOTES_TTL) buildVotesCache()
+    return
+  }
+  await buildVotesCache()
+  if (votesCache.data) return res.json(votesCache.data)
+  res.status(503).json({ error: 'Votes not ready' })
 })
 
 app.get('/summary/:dokId', async (req, res) => {
   const apiKey = req.headers['x-api-key'] || process.env.ANTHROPIC_API_KEY
-  if (!apiKey) return res.status(401).json({error:'Missing API key'})
+  if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
   try {
     const result = await generateAndCache(req.params.dokId, req.query.title || req.params.dokId, req.query.date || '', apiKey)
-    if (!result) return res.status(500).json({error:'Could not generate'})
-    res.json({dok_id: req.params.dokId, ...result})
-  } catch(e) { res.status(500).json({error: e.message}) }
+    if (!result) return res.status(500).json({ error: 'Could not generate' })
+    res.json({ dok_id: req.params.dokId, ...result })
+  } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
 app.get('/api/*', async (req, res) => {
   const path = req.params[0]
   const query = req.url.includes('?') ? '?' + req.url.split('?').slice(1).join('?') : ''
   try {
-    const r = await fetch(`https://data.riksdagen.se/${path}${query}`, {headers:{'User-Agent':'Civica/1.0'}})
+    const r = await fetch(`https://data.riksdagen.se/${path}${query}`, { headers: { 'User-Agent': 'Civica/1.0' } })
     const ct = r.headers.get('content-type') ?? ''
-    if (ct.includes('json')) {
-      res.status(r.status).json(await r.json())
-    } else {
-      res.status(r.status).type(ct || 'text/plain').send(await r.text())
-    }
-  } catch(err) { res.status(500).json({error: String(err)}) }
+    if (ct.includes('json')) { res.status(r.status).json(await r.json()) }
+    else { res.status(r.status).type(ct || 'text/plain').send(await r.text()) }
+  } catch(err) { res.status(500).json({ error: String(err) }) }
 })
 
 app.post('/ai', async (req, res) => {
   const apiKey = req.headers['x-api-key']
-  if (!apiKey) return res.status(401).json({error:'Missing API key'})
+  if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify(req.body),
     })
     res.status(r.status).json(await r.json())
-  } catch(e) { res.status(500).json({error: e.message}) }
+  } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
-app.get('/health', (_, res) => res.json({ok:true, cached:summaryCache.size}))
-app.listen(PORT, () => console.log(`Civica backend på port ${PORT}`))
+app.get('/health', (_, res) => res.json({ ok: true, summaries: summaryCache.size }))
+
+// ── Startup ───────────────────────────────────────────────────────────────────
+
+async function start() {
+  await initDb()
+  buildVotesCache()
+  runAutoFetch()
+  setInterval(runAutoFetch, 60 * 60 * 1000) // every hour
+  app.listen(PORT, () => console.log(`Civica backend on port ${PORT}`))
+}
+
+start().catch(e => { console.error('Startup error:', e); process.exit(1) })
