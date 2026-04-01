@@ -54,6 +54,23 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       approved_at TIMESTAMPTZ
     );
+    ALTER TABLE votes ADD COLUMN IF NOT EXISTS voter_id TEXT;
+    CREATE TABLE IF NOT EXISTS reactions (
+      debate_id TEXT NOT NULL,
+      bloc TEXT NOT NULL,
+      reaction TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (debate_id, bloc, reaction)
+    );
+    CREATE TABLE IF NOT EXISTS valkompass_stats (
+      party_id TEXT PRIMARY KEY,
+      count INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value JSONB,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `)
   console.log('DB: tables ready')
 }
@@ -183,7 +200,7 @@ async function generateAndCache(dokId, title, date, apiKey) {
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 700,
-      messages: [{ role: 'user', content: `Du är en politisk journalist. Sammanfatta denna riksdagsdebatt för unga väljare. Basera ENBART på texten nedan.\n\nKontext: I Sverige 2025/26 är regeringspartierna M, KD, L, C, SD = högerblocket. Oppositionspartierna S, MP, V = vänsterblocket.\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON:\n{"ingress":"2-3 meningar om vad debatten handlade om.","vansterblocket":{"parties":["faktiska vänsterpartier som talade"],"summary":"Vad de argumenterade för, 2-4 meningar.","keyArg":"Deras starkaste argument, 1 mening."},"hogerblocket":{"parties":["faktiska högerpartier/ministern som talade"],"summary":"Vad ministern/högerblocket argumenterade för, 2-4 meningar.","keyArg":"Deras starkaste argument, 1 mening."}}` }]
+      messages: [{ role: 'user', content: `Du är en politisk journalist. Sammanfatta denna riksdagsdebatt för unga väljare. Basera ENBART på texten nedan.\n\nViktigt: Använd ALLTID partiförkortningar (S, M, SD, KD, L, C, V, MP) direkt i texten. Skriv ALDRIG "högerblocket" eller "vänsterblocket" – nämn istället partierna vid namn.\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON:\n{"ingress":"2-3 meningar om vad debatten handlade om. Namnge partierna (t.ex. S, M, SD) direkt – aldrig 'högerblocket'/'vänsterblocket'.","vansterblocket":{"parties":["partiförkortningar som talade, t.ex. S, V, MP"],"summary":"Vad de argumenterade för, 2-4 meningar. Nämn partierna vid förkortning.","keyArg":"Deras starkaste argument, 1 mening."},"hogerblocket":{"parties":["partiförkortningar som talade, t.ex. M, SD, KD, L, C"],"summary":"Vad de argumenterade för, 2-4 meningar. Nämn partierna vid förkortning.","keyArg":"Deras starkaste argument, 1 mening."}}` }]
     })
   })
   const aiData = await aiRes.json()
@@ -345,6 +362,7 @@ function dbDebateToFrontend(row) {
 function dbVoteToFrontend(row) {
   return {
     id: row.id,
+    voterId: row.voter_id || null,
     title: row.title,
     humanTitle: row.human_title,
     topicEmoji: row.topic_emoji || '',
@@ -412,14 +430,14 @@ async function runAutoFetch() {
       let title = item.beteckning || item.votering_id
       let date = (item.datum || '').slice(0, 10)
       let partyVotes = []
-      let dokId = null
+      let dokId = item.beteckning || null
 
       try {
         const detail = await parseVoteDetail(item.votering_id)
         title = detail.title || title
         date = detail.date || date
         partyVotes = detail.partyVotes
-        dokId = detail.dokId
+        dokId = item.beteckning || detail.dokId || null
       } catch(e) { console.error(`Vote detail failed ${item.votering_id}:`, e.message) }
 
       const baseVote = {
@@ -439,9 +457,9 @@ async function runAutoFetch() {
       } catch(e) { console.error(`Vote AI failed ${item.votering_id}:`, e.message) }
 
       await pool.query(
-        `INSERT INTO votes (id, title, human_title, topic_emoji, date, total_ja, total_nej, total_avstar, total_franvarande, party_votes, dok_id, outcome, ja_meaning, nej_meaning, consequence, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pending') ON CONFLICT (id) DO NOTHING`,
-        [baseVote.id, baseVote.title, humanTitle, topicEmoji, baseVote.date,
+        `INSERT INTO votes (id, voter_id, title, human_title, topic_emoji, date, total_ja, total_nej, total_avstar, total_franvarande, party_votes, dok_id, outcome, ja_meaning, nej_meaning, consequence, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending') ON CONFLICT (id) DO NOTHING`,
+        [baseVote.id, item.votering_id, baseVote.title, humanTitle, topicEmoji, baseVote.date,
          baseVote.totalJa, baseVote.totalNej, baseVote.totalAvstar, baseVote.totalFranvarande,
          JSON.stringify(baseVote.partyVotes), baseVote.dokId, baseVote.outcome,
          jaMeaning, nejMeaning, consequence]
@@ -482,6 +500,25 @@ app.get('/admin/votes', requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM votes ORDER BY created_at DESC')
     res.json(rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/admin/fix-vote-dokids', requireAdmin, async (req, res) => {
+  try {
+    const listRes = await fetchWithTimeout('https://data.riksdagen.se/voteringlista/?sz=50&utformat=json&gruppering=votering_id&sort=datum&sortorder=desc')
+    const listData = await listRes.json()
+    const items = listData?.voteringlista?.votering ?? []
+    const arr = Array.isArray(items) ? items : [items]
+    let updated = 0
+    for (const item of arr) {
+      if (!item.beteckning || !item.votering_id) continue
+      const result = await pool.query(
+        'UPDATE votes SET dok_id = $1 WHERE id = $2 AND (dok_id IS NULL OR dok_id = \'\')',
+        [item.beteckning, item.votering_id]
+      )
+      updated += result.rowCount
+    }
+    res.json({ updated })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
@@ -551,6 +588,114 @@ app.delete('/admin/votes/:id', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM votes WHERE id = $1', [req.params.id])
     res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// ── Intro settings ────────────────────────────────────────────────────────────
+
+const DEFAULT_INTRO = {
+  badge: 'RIKSDAGEN · LIVE',
+  headingPre: 'Vad händer i',
+  words: ['Debatter', 'Omröstningar', 'Politik'],
+  headingPost: 'just nu?',
+  subtitle: 'Civica samlar riksdagens senaste debatter och omröstningar — utan krångel.',
+  chips: [
+    { icon: '🗣️', text: 'Debatter' },
+    { icon: '🗳️', text: 'Omröstningar' },
+    { icon: '⚖️', text: 'Valkompassen' },
+  ],
+}
+
+app.get('/api/public/intro-settings', async (_req, res) => {
+  try {
+    const r = await pool.query("SELECT value FROM settings WHERE key = 'intro'")
+    res.json(r.rows[0]?.value ?? DEFAULT_INTRO)
+  } catch(e) { res.json(DEFAULT_INTRO) }
+})
+
+app.put('/admin/intro-settings', requireAdmin, async (req, res) => {
+  try {
+    const value = req.body
+    await pool.query(`
+      INSERT INTO settings (key, value, updated_at) VALUES ('intro', $1, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()
+    `, [JSON.stringify(value)])
+    res.json(value)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// ── Reactions ─────────────────────────────────────────────────────────────────
+
+app.get('/api/public/reactions/:debateId', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT bloc, reaction, count FROM reactions WHERE debate_id = $1',
+      [req.params.debateId]
+    )
+    // Return { left: { up: N, down: N }, right: { up: N, down: N } }
+    const result = { left: { up: 0, down: 0 }, right: { up: 0, down: 0 } }
+    for (const r of rows) {
+      if (result[r.bloc] !== undefined && (r.reaction === 'up' || r.reaction === 'down')) {
+        result[r.bloc][r.reaction] = r.count
+      }
+    }
+    res.json(result)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/api/public/reactions/:debateId/:bloc/:reaction', async (req, res) => {
+  const { debateId, bloc, reaction } = req.params
+  if (!['left', 'right'].includes(bloc) || !['up', 'down'].includes(reaction)) {
+    return res.status(400).json({ error: 'Invalid params' })
+  }
+  try {
+    const { rows } = await pool.query(`
+      INSERT INTO reactions (debate_id, bloc, reaction, count)
+      VALUES ($1, $2, $3, 1)
+      ON CONFLICT (debate_id, bloc, reaction) DO UPDATE SET count = reactions.count + 1
+      RETURNING count
+    `, [debateId, bloc, reaction])
+    res.json({ count: rows[0].count })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// ── Valkompass stats ──────────────────────────────────────────────────────────
+
+app.post('/api/public/valkompass/:partyId', async (req, res) => {
+  const { partyId } = req.params
+  const validParties = ['S', 'M', 'SD', 'C', 'V', 'KD', 'L', 'MP']
+  if (!validParties.includes(partyId.toUpperCase())) {
+    return res.status(400).json({ error: 'Invalid party' })
+  }
+  try {
+    const { rows } = await pool.query(`
+      INSERT INTO valkompass_stats (party_id, count)
+      VALUES ($1, 1)
+      ON CONFLICT (party_id) DO UPDATE SET count = valkompass_stats.count + 1
+      RETURNING count
+    `, [partyId.toUpperCase()])
+    res.json({ count: rows[0].count })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// ── Admin stats ───────────────────────────────────────────────────────────────
+
+app.get('/admin/stats/reactions', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT r.debate_id, d.title, r.bloc, r.reaction, r.count
+      FROM reactions r
+      LEFT JOIN debates d ON d.id = r.debate_id
+      ORDER BY r.debate_id, r.bloc, r.reaction
+    `)
+    res.json(rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/admin/stats/valkompass', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT party_id, count FROM valkompass_stats ORDER BY count DESC')
+    res.json(rows)
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
