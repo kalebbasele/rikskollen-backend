@@ -647,7 +647,7 @@ app.post('/admin/refetch-bet-debates', requireAdmin, async (req, res) => {
     for (const debate of debates) {
       await pool.query(
         `INSERT INTO debates (id, dok_id, dok_type, title, topic, topic_emoji, date, venue, participants, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'approved') ON CONFLICT (id) DO NOTHING`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending') ON CONFLICT (id) DO NOTHING`,
         [debate.id, debate.dokId, 'bet', debate.title, debate.topic, debate.topicEmoji, debate.date, debate.venue, JSON.stringify(debate.participants)]
       )
       saved++
