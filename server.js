@@ -639,6 +639,23 @@ app.delete('/admin/votes/:id', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+app.post('/admin/refetch-bet-debates', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM debates WHERE dok_type = 'bet'")
+    const debates = await fetchBetankandeDebates()
+    let saved = 0
+    for (const debate of debates) {
+      await pool.query(
+        `INSERT INTO debates (id, dok_id, dok_type, title, topic, topic_emoji, date, venue, participants, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'approved') ON CONFLICT (id) DO NOTHING`,
+        [debate.id, debate.dokId, 'bet', debate.title, debate.topic, debate.topicEmoji, debate.date, debate.venue, JSON.stringify(debate.participants)]
+      )
+      saved++
+    }
+    res.json({ deleted: true, saved })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 // ── Intro settings ────────────────────────────────────────────────────────────
 
 const DEFAULT_INTRO = {
