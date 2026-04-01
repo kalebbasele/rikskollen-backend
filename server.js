@@ -55,6 +55,7 @@ async function initDb() {
       approved_at TIMESTAMPTZ
     );
     ALTER TABLE votes ADD COLUMN IF NOT EXISTS voter_id TEXT;
+    ALTER TABLE debates ADD COLUMN IF NOT EXISTS dok_type TEXT DEFAULT 'ip';
     CREATE TABLE IF NOT EXISTS reactions (
       debate_id TEXT NOT NULL,
       bloc TEXT NOT NULL,
@@ -262,7 +263,57 @@ Svara ENDAST med JSON:
   return JSON.parse(text.replace(/```json|```/g, '').trim())
 }
 
-// ── Riksdagen debate parser (ported from frontend) ────────────────────────────
+// ── Riksdagen debate parser ───────────────────────────────────────────────────
+
+function parseParticipants(dok) {
+  const intressenter = (() => { const i = dok.dokintressent?.intressent; if (!i) return []; return Array.isArray(i) ? i : [i] })()
+  const anforanden = (() => { const a = dok.debatt?.anforande; if (!a) return []; return Array.isArray(a) ? a : [a] })()
+
+  const anforMap = new Map()
+  for (const a of anforanden) {
+    if (a.intressent_id && !anforMap.has(a.intressent_id)) {
+      anforMap.set(a.intressent_id, { name: cleanName(a.talare ?? ''), party: a.parti || a.partibet || '' })
+    }
+  }
+
+  const makeParticipant = (i, role) => {
+    const id = i.intressent_id ?? ''
+    const fromAnf = anforMap.get(id)
+    const name = fromAnf?.name || cleanName(i.namn ?? 'Okänd')
+    const party = i.partibet || i.parti || fromAnf?.party || ''
+    return { person: { id, name, firstName: name.split(' ')[0], lastName: name.split(' ').slice(1).join(' '), party, photoUrl: personPhotoUrl(id) }, role }
+  }
+
+  const seen = new Set()
+  const participants = []
+
+  const undertecknare = intressenter.find(i => i.roll === 'undertecknare')
+  if (undertecknare?.intressent_id) { seen.add(undertecknare.intressent_id); participants.push(makeParticipant(undertecknare, 'undertecknare')) }
+
+  const besvaradav = intressenter.find(i => i.roll === 'besvaradav')
+  if (besvaradav?.intressent_id && !seen.has(besvaradav.intressent_id)) { seen.add(besvaradav.intressent_id); participants.push(makeParticipant(besvaradav, 'besvaradav')) }
+
+  for (const a of anforanden) {
+    const id = a.intressent_id
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    const fromDok = intressenter.find(i => i.intressent_id === id)
+    if (fromDok) {
+      participants.push(makeParticipant(fromDok, 'talare'))
+    } else {
+      const name = cleanName(a.talare ?? 'Okänd')
+      participants.push({ person: { id, name, firstName: name.split(' ')[0], lastName: name.split(' ').slice(1).join(' '), party: a.parti || a.partibet || '', photoUrl: personPhotoUrl(id) }, role: 'talare' })
+    }
+  }
+
+  const seenNames = new Set()
+  return participants.filter(p => {
+    const key = p.person.name.toLowerCase().trim()
+    if (seenNames.has(key)) return false
+    seenNames.add(key)
+    return true
+  })
+}
 
 async function fetchDebatesFromRiksdagen() {
   const res = await fetch('https://data.riksdagen.se/dokumentlista/?doktyp=ip&utformat=json&antal=30&sort=debattdag&sortorder=desc')
@@ -275,67 +326,53 @@ async function fetchDebatesFromRiksdagen() {
   for (const dok of dokument) {
     if (debates.length >= 20) break
     if (!dok.debatt) continue
-
-    const intressenter = (() => { const i = dok.dokintressent?.intressent; if (!i) return []; return Array.isArray(i) ? i : [i] })()
-    const anforanden = (() => { const a = dok.debatt?.anforande; if (!a) return []; return Array.isArray(a) ? a : [a] })()
-
-    const anforMap = new Map()
-    for (const a of anforanden) {
-      if (a.intressent_id && !anforMap.has(a.intressent_id)) {
-        anforMap.set(a.intressent_id, { name: cleanName(a.talare ?? ''), party: a.parti || a.partibet || '' })
-      }
-    }
-
-    const makeParticipant = (i, role) => {
-      const id = i.intressent_id ?? ''
-      const fromAnf = anforMap.get(id)
-      const name = fromAnf?.name || cleanName(i.namn ?? 'Okänd')
-      const party = i.partibet || i.parti || fromAnf?.party || ''
-      return { person: { id, name, firstName: name.split(' ')[0], lastName: name.split(' ').slice(1).join(' '), party, photoUrl: personPhotoUrl(id) }, role }
-    }
-
-    const seen = new Set()
-    const participants = []
-
-    const undertecknare = intressenter.find(i => i.roll === 'undertecknare')
-    if (undertecknare?.intressent_id) { seen.add(undertecknare.intressent_id); participants.push(makeParticipant(undertecknare, 'undertecknare')) }
-
-    const besvaradav = intressenter.find(i => i.roll === 'besvaradav')
-    if (besvaradav?.intressent_id && !seen.has(besvaradav.intressent_id)) { seen.add(besvaradav.intressent_id); participants.push(makeParticipant(besvaradav, 'besvaradav')) }
-
-    for (const a of anforanden) {
-      const id = a.intressent_id
-      if (!id || seen.has(id)) continue
-      seen.add(id)
-      const fromDok = intressenter.find(i => i.intressent_id === id)
-      if (fromDok) {
-        participants.push(makeParticipant(fromDok, 'talare'))
-      } else {
-        const name = cleanName(a.talare ?? 'Okänd')
-        participants.push({ person: { id, name, firstName: name.split(' ')[0], lastName: name.split(' ').slice(1).join(' '), party: a.parti || a.partibet || '', photoUrl: personPhotoUrl(id) }, role: 'talare' })
-      }
-    }
-
+    const participants = parseParticipants(dok)
     if (participants.length === 0) continue
-
-    const seenNames = new Set()
-    const uniqueParticipants = participants.filter(p => {
-      const key = p.person.name.toLowerCase().trim()
-      if (seenNames.has(key)) return false
-      seenNames.add(key)
-      return true
-    })
-
+    const anforanden = (() => { const a = dok.debatt?.anforande; if (!a) return []; return Array.isArray(a) ? a : [a] })()
     const debattdag = dok.debattdag || anforanden[0]?.anf_datumtid?.slice(0, 10) || dok.datum || ''
     debates.push({
       id: dok.dok_id,
       dokId: dok.dok_id,
+      dokType: 'ip',
       title: dok.titel ?? 'Debatt',
       topic: dok.debattnamn ?? 'Interpellationsdebatt',
       topicEmoji: '',
       date: debattdag,
       venue: 'Riksdagens kammare',
-      participants: uniqueParticipants,
+      participants,
+    })
+  }
+  return debates.sort((a, b) => b.date > a.date ? 1 : -1)
+}
+
+async function fetchBetankandeDebates() {
+  const res = await fetch('https://data.riksdagen.se/dokumentlista/?doktyp=bet&utformat=json&antal=50&sort=datum&sortorder=desc')
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const data = await res.json()
+  const rawDok = data?.dokumentlista?.dokument ?? []
+  const dokument = Array.isArray(rawDok) ? rawDok : [rawDok]
+  const debates = []
+
+  for (const dok of dokument) {
+    if (debates.length >= 20) break
+    // Only include if there's an actual protocol with speeches
+    const anforanden = (() => { const a = dok.debatt?.anforande; if (!a) return []; return Array.isArray(a) ? a : [a] })()
+    if (anforanden.length === 0) continue
+    const participants = parseParticipants(dok)
+    if (participants.length === 0) continue
+    const debattdag = dok.debattdag || anforanden[0]?.anf_datumtid?.slice(0, 10) || dok.datum || ''
+    // Use committee/organ as topic
+    const topic = dok.organ ? `Utskottsdebatt · ${dok.organ.toUpperCase()}` : (dok.debattnamn ?? 'Debatt om förslag')
+    debates.push({
+      id: dok.dok_id,
+      dokId: dok.dok_id,
+      dokType: 'bet',
+      title: dok.titel ?? dok.notisrubrik ?? 'Betänkandedebatt',
+      topic,
+      topicEmoji: '',
+      date: debattdag,
+      venue: 'Riksdagens kammare',
+      participants,
     })
   }
   return debates.sort((a, b) => b.date > a.date ? 1 : -1)
@@ -347,6 +384,7 @@ function dbDebateToFrontend(row) {
   return {
     id: row.id,
     dokId: row.dok_id,
+    dokType: row.dok_type || 'ip',
     title: row.title,
     topic: row.topic,
     topicEmoji: row.topic_emoji || '',
@@ -387,9 +425,8 @@ async function runAutoFetch() {
   if (!apiKey) { console.log('Auto-fetch: no ANTHROPIC_API_KEY, skipping'); return }
   console.log('Auto-fetch: starting...')
 
-  // 1. Debates
-  try {
-    const debates = await fetchDebatesFromRiksdagen()
+  // 1. Debates (interpellationer + betänkandedebatter)
+  async function saveDebates(debates) {
     for (const debate of debates) {
       const existing = await pool.query('SELECT id FROM debates WHERE id = $1', [debate.id])
       if (existing.rows.length > 0) continue
@@ -405,15 +442,26 @@ async function runAutoFetch() {
       } catch(e) { console.error(`AI debate failed ${debate.id}:`, e.message) }
 
       await pool.query(
-        `INSERT INTO debates (id, dok_id, title, topic, topic_emoji, date, venue, participants, ingress, left_bloc, right_bloc, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending') ON CONFLICT (id) DO NOTHING`,
-        [debate.id, debate.dokId, debate.title, debate.topic, debate.topicEmoji, debate.date, debate.venue,
+        `INSERT INTO debates (id, dok_id, dok_type, title, topic, topic_emoji, date, venue, participants, ingress, left_bloc, right_bloc, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending') ON CONFLICT (id) DO NOTHING`,
+        [debate.id, debate.dokId, debate.dokType ?? 'ip', debate.title, debate.topic, debate.topicEmoji, debate.date, debate.venue,
          JSON.stringify(debate.participants), ingress,
          leftBloc ? JSON.stringify(leftBloc) : null,
          rightBloc ? JSON.stringify(rightBloc) : null]
       )
-      console.log(`Auto-fetch: saved debate "${debate.title}"`)
+      console.log(`Auto-fetch: saved debate "${debate.title}" (${debate.dokType ?? 'ip'})`)
     }
+  }
+
+  try {
+    const [ipDebates, betDebates] = await Promise.allSettled([
+      fetchDebatesFromRiksdagen(),
+      fetchBetankandeDebates(),
+    ])
+    if (ipDebates.status === 'fulfilled') await saveDebates(ipDebates.value)
+    else console.error('Auto-fetch ip debates error:', ipDebates.reason?.message)
+    if (betDebates.status === 'fulfilled') await saveDebates(betDebates.value)
+    else console.error('Auto-fetch bet debates error:', betDebates.reason?.message)
   } catch(e) { console.error('Auto-fetch debates error:', e.message) }
 
   // 2. Votes
