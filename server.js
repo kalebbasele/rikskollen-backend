@@ -56,6 +56,17 @@ async function initDb() {
     );
     ALTER TABLE votes ADD COLUMN IF NOT EXISTS voter_id TEXT;
     ALTER TABLE debates ADD COLUMN IF NOT EXISTS dok_type TEXT DEFAULT 'ip';
+    CREATE TABLE IF NOT EXISTS fragstund (
+      id TEXT PRIMARY KEY,
+      dok_id TEXT UNIQUE,
+      title TEXT,
+      date TEXT,
+      anforanden_count INTEGER DEFAULT 0,
+      summary TEXT,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      approved_at TIMESTAMPTZ
+    );
     CREATE TABLE IF NOT EXISTS reactions (
       debate_id TEXT NOT NULL,
       bloc TEXT NOT NULL,
@@ -151,7 +162,48 @@ async function fetchAnforandenByHtml(dokId) {
   } catch { return '' }
 }
 
-async function fetchProtocolSection(date, title) {
+// Hittar rätt debattsektion i protokollet.
+// Pass 1: letar efter förekomst följd av "föredrogs" inom 300 tecken (exakt debattstart).
+// Pass 2: fallback — väljer förekomst med längst genomsnittliga ord (löptext vs TOC).
+function findBestSectionInProtocol(clean, searchTerms) {
+  for (const term of searchTerms) {
+    if (!term) continue
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const pattern = new RegExp(escaped, 'i')
+    let searchFrom = 0
+    let m
+
+    // Pass 1: "föredrogs" nearby = actual debate section
+    while ((m = clean.slice(searchFrom).search(pattern)) >= 0) {
+      const absoluteIdx = searchFrom + m
+      if (/f\u00f6redrogs/i.test(clean.slice(absoluteIdx, absoluteIdx + 300))) {
+        const section = clean.slice(absoluteIdx, absoluteIdx + 20000)
+        if (section.length >= 200) return section
+      }
+      searchFrom = absoluteIdx + 1
+      if (searchFrom >= clean.length) break
+    }
+
+    // Pass 2: pick occurrence with highest avg word length (actual text > TOC entries)
+    let bestIdx = -1, bestScore = -1
+    searchFrom = 0
+    while ((m = clean.slice(searchFrom).search(pattern)) >= 0) {
+      const absoluteIdx = searchFrom + m
+      const words = clean.slice(absoluteIdx, absoluteIdx + 3000).split(/\s+/).filter(w => w.length > 0)
+      const avgLen = words.reduce((s, w) => s + w.length, 0) / (words.length || 1)
+      if (avgLen > bestScore) { bestScore = avgLen; bestIdx = absoluteIdx }
+      searchFrom = absoluteIdx + 1
+      if (searchFrom >= clean.length) break
+    }
+    if (bestIdx >= 0) {
+      const section = clean.slice(Math.max(0, bestIdx - 500), bestIdx + 20000)
+      if (section.length >= 200) return section
+    }
+  }
+  return ''
+}
+
+async function fetchProtocolSection(date, title, dokId = '') {
   try {
     const dateStr = date.replace(/-/g, '')
     const protRes = await fetch(`https://data.riksdagen.se/dokumentlista/?doktyp=prot&from=${dateStr}&tom=${dateStr}&utformat=json&antal=20`)
@@ -160,29 +212,67 @@ async function fetchProtocolSection(date, title) {
     const protArr = Array.isArray(protDocs) ? protDocs : [protDocs]
     const matching = protArr.filter(p => p.datum === date)
     const candidates = matching.length > 0 ? matching : protArr.slice(0, 1)
-    const searchWord = (title || '').split(' ').find(w => w.length > 4) || 'interpellation'
+
+    // Build search terms: beteckning first (most precise), then title words
+    const beteckning = dokId ? dokId.replace(/^HD\d+/i, '') : ''  // e.g. 'HD01SoU19' → 'SoU19'
+    const titleWords = (title || '').split(' ').filter(w => w.length > 4)
+    const searchTerms = [beteckning, ...titleWords].filter(Boolean)
+
     for (const prot of candidates) {
       const res = await fetch(`https://data.riksdagen.se/dokument/${prot.dok_id}.text`)
       const raw = await res.text()
       const clean = stripTags(raw)
-      const match = clean.search(new RegExp(searchWord, 'i'))
-      if (match >= 0) {
-        const section = clean.slice(Math.max(0, match - 300), match + 15000)
-        if (section.length >= 200) return section
-      }
+      const section = findBestSectionInProtocol(clean, searchTerms)
+      if (section) return section
     }
   } catch {}
   return ''
 }
 
-async function fetchDebateText(dokId, date, title) {
+// Söker anföranden via nyckelord i titeln — hittar debatten även om dok_id-kopplingen saknas
+async function fetchAnforandenByTitle(title, kammaraktivitet = '') {
+  try {
+    const words = (title || '').split(/\s+/).filter(w => w.length > 4).slice(0, 4)
+    if (words.length === 0) return ''
+    const today = new Date()
+    const from = new Date(today); from.setMonth(from.getMonth() - 6)
+    const fromStr = from.toISOString().slice(0, 10).replace(/-/g, '')
+    const tomStr = today.toISOString().slice(0, 10).replace(/-/g, '')
+    const kamUrl = kammaraktivitet ? `&kammaraktivitet=${encodeURIComponent(kammaraktivitet)}` : ''
+    const res = await fetch(
+      `https://data.riksdagen.se/anforandelista/?utformat=json&antal=200&from=${fromStr}&tom=${tomStr}${kamUrl}`
+    )
+    const data = await res.json()
+    const list = data?.anforandelista?.anforande ?? []
+    const arr = Array.isArray(list) ? list : [list]
+    const relevant = arr.filter(a => {
+      const rubrik = ((a.avsnittsrubrik || '') + ' ' + (a.kammaraktivitet || '')).toLowerCase()
+      return words.some(w => rubrik.includes(w.toLowerCase()))
+    })
+    if (relevant.length === 0) return ''
+    console.log(`fetchAnforandenByTitle(${kammaraktivitet}): ${relevant.length} träffar för "${words.join(' ')}"`)
+    const results = await Promise.allSettled(
+      relevant.slice(0, 8).map(async a => {
+        if (!a.anforande_url_html) return ''
+        const r = await fetch(a.anforande_url_html)
+        const html = await r.text()
+        const text = stripTags(html).trim()
+        return text.length > 50 ? `[${a.talare} (${a.parti})]: ${text.slice(0, 1500)}` : ''
+      })
+    )
+    return results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value).join('\n\n')
+  } catch(e) { console.error('fetchAnforandenByTitle error:', e.message); return '' }
+}
+
+async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
   try {
     const results = await Promise.allSettled([
       fetchAnforanden(`https://data.riksdagen.se/anforandelista/?rel_dok_id=${dokId}&utformat=json&antal=20`),
       fetchAnforanden(`https://data.riksdagen.se/anforandelista/?dokid=${dokId}&utformat=json&antal=20`),
       fetchAnforandenByHtml(dokId),
-      date ? fetchProtocolSection(date, title) : Promise.resolve(''),
+      date ? fetchProtocolSection(date, title, dokId) : Promise.resolve(''),
       fetch(`https://data.riksdagen.se/dokument/${dokId}.text`).then(r => r.text()).then(stripTags).catch(() => ''),
+      fetchAnforandenByTitle(title, kammaraktivitet),
     ])
     const texts = results.map(r => r.status === 'fulfilled' ? r.value : '')
     const best = texts.filter(t => t.length >= 200).sort((a, b) => b.length - a.length)[0]
@@ -191,9 +281,10 @@ async function fetchDebateText(dokId, date, title) {
   return ''
 }
 
-async function generateAndCache(dokId, title, date, apiKey) {
+async function generateAndCache(dokId, title, date, apiKey, dokType = 'ip') {
   if (summaryCache.has(dokId)) return summaryCache.get(dokId)
-  const protocol = await fetchDebateText(dokId, date, title)
+  const kammaraktivitet = dokType === 'bet' ? 'betankandedebatt' : 'interpellationsdebatt'
+  const protocol = await fetchDebateText(dokId, date, title, kammaraktivitet)
   if (!protocol || protocol.length < 100) return null
   const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -378,6 +469,48 @@ async function fetchBetankandeDebates() {
   return debates.sort((a, b) => b.date > a.date ? 1 : -1)
 }
 
+async function fetchFragstund() {
+  const res = await fetch('https://data.riksdagen.se/dokumentlista/?doktyp=kam-fs&utformat=json&antal=50&sort=datum&sortorder=desc')
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const data = await res.json()
+  const rawDok = data?.dokumentlista?.dokument ?? []
+  const dokument = Array.isArray(rawDok) ? rawDok : [rawDok]
+  const result = []
+
+  for (const dok of dokument) {
+    // Only include frågestund that have a debate protocol with speeches
+    const anforanden = (() => { const a = dok.debatt?.anforande; if (!a) return []; return Array.isArray(a) ? a : [a] })()
+    if (anforanden.length === 0) continue
+    const date = (dok.datum ?? '').slice(0, 10)
+    result.push({
+      id: dok.dok_id,
+      dokId: dok.dok_id,
+      title: dok.titel ?? 'Frågestund',
+      date,
+      anforandenCount: anforanden.length,
+    })
+  }
+  return result.sort((a, b) => b.date > a.date ? 1 : -1)
+}
+
+async function generateFragstundSummary(dokId, title, date, apiKey) {
+  const protocol = await fetchDebateText(dokId, date, title, 'fragstund')
+  if (!protocol || protocol.length < 100) return null
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: `Du är en politisk journalist. Sammanfatta denna riksdagens frågestund i 2-3 meningar för unga väljare. Nämn vilka ämnen som togs upp och av vilka partier. Basera ENBART på texten nedan.\n\nTitel: ${title}\n\n${protocol.slice(0, 6000)}\n\nSvara ENDAST med en JSON: {"summary":"2-3 meningar om vad som diskuterades i frågestunden."}` }]
+    })
+  })
+  const aiData = await res.json()
+  const text = aiData.content?.[0]?.text ?? ''
+  const parsed = JSON.parse(text.replace(/```json|```/g, '').trim())
+  return parsed.summary ?? null
+}
+
 // ── DB mappers ────────────────────────────────────────────────────────────────
 
 function dbDebateToFrontend(row) {
@@ -418,6 +551,17 @@ function dbVoteToFrontend(row) {
   }
 }
 
+function dbFragstundToFrontend(row) {
+  return {
+    id: row.id,
+    dokId: row.dok_id,
+    title: row.title,
+    date: row.date,
+    anforandenCount: row.anforanden_count || 0,
+    summary: row.summary,
+  }
+}
+
 // ── Auto-fetch job ────────────────────────────────────────────────────────────
 
 async function runAutoFetch() {
@@ -428,12 +572,32 @@ async function runAutoFetch() {
   // 1. Debates (interpellationer + betänkandedebatter)
   async function saveDebates(debates) {
     for (const debate of debates) {
-      const existing = await pool.query('SELECT id FROM debates WHERE id = $1', [debate.id])
-      if (existing.rows.length > 0) continue
+      const existing = await pool.query('SELECT id, ingress FROM debates WHERE id = $1', [debate.id])
 
+      if (existing.rows.length > 0) {
+        // Already saved — retry AI only if ingress is still missing
+        if (existing.rows[0].ingress) continue
+        let ingress = null, leftBloc = null, rightBloc = null
+        try {
+          const summary = await generateAndCache(debate.dokId, debate.title, debate.date, apiKey, debate.dokType ?? 'ip')
+          if (summary) {
+            ingress = summary.ingress
+            leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+            rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+            await pool.query(
+              'UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE id = $4',
+              [ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), debate.id]
+            )
+            console.log(`Auto-fetch: filled in missing summary for "${debate.title}"`)
+          }
+        } catch(e) { console.error(`AI retry failed ${debate.id}:`, e.message) }
+        continue
+      }
+
+      // New debate — generate summary and insert
       let ingress = null, leftBloc = null, rightBloc = null
       try {
-        const summary = await generateAndCache(debate.dokId, debate.title, debate.date, apiKey)
+        const summary = await generateAndCache(debate.dokId, debate.title, debate.date, apiKey, debate.dokType ?? 'ip')
         if (summary) {
           ingress = summary.ingress
           leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
@@ -516,6 +680,39 @@ async function runAutoFetch() {
     }
   } catch(e) { console.error('Auto-fetch votes error:', e.message) }
 
+  // 3. Frågestund
+  try {
+    const fragstundList = await fetchFragstund()
+    for (const fs of fragstundList) {
+      const existing = await pool.query('SELECT id, summary FROM fragstund WHERE id = $1', [fs.id])
+
+      if (existing.rows.length > 0) {
+        // Already saved — retry AI only if summary is still missing
+        if (existing.rows[0].summary) continue
+        try {
+          const summary = await generateFragstundSummary(fs.dokId, fs.title, fs.date, apiKey)
+          if (summary) {
+            await pool.query('UPDATE fragstund SET summary = $1 WHERE id = $2', [summary, fs.id])
+            console.log(`Auto-fetch: filled in missing summary for frågestund "${fs.title}"`)
+          }
+        } catch(e) { console.error(`AI fragstund retry failed ${fs.id}:`, e.message) }
+        continue
+      }
+
+      let summary = null
+      try {
+        summary = await generateFragstundSummary(fs.dokId, fs.title, fs.date, apiKey)
+      } catch(e) { console.error(`AI fragstund failed ${fs.id}:`, e.message) }
+
+      await pool.query(
+        `INSERT INTO fragstund (id, dok_id, title, date, anforanden_count, summary, status)
+         VALUES ($1,$2,$3,$4,$5,$6,'pending') ON CONFLICT (id) DO NOTHING`,
+        [fs.id, fs.dokId, fs.title, fs.date, fs.anforandenCount, summary]
+      )
+      console.log(`Auto-fetch: saved frågestund "${fs.title}" (${fs.date})`)
+    }
+  } catch(e) { console.error('Auto-fetch fragstund error:', e.message) }
+
   console.log('Auto-fetch: done')
 }
 
@@ -532,6 +729,13 @@ app.get('/api/public/votes', async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM votes WHERE status = 'approved' ORDER BY date DESC")
     res.json(rows.map(dbVoteToFrontend))
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/public/fragstund', async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM fragstund WHERE status = 'approved' ORDER BY date DESC")
+    res.json(rows.map(dbFragstundToFrontend))
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
@@ -636,6 +840,80 @@ app.delete('/admin/votes/:id', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM votes WHERE id = $1', [req.params.id])
     res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/admin/fragstund', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM fragstund ORDER BY created_at DESC')
+    res.json(rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.patch('/admin/fragstund/:id', requireAdmin, async (req, res) => {
+  const { title, summary } = req.body
+  try {
+    await pool.query(
+      `UPDATE fragstund SET title = COALESCE($1, title), summary = COALESCE($2, summary) WHERE id = $3`,
+      [title ?? null, summary ?? null, req.params.id]
+    )
+    const { rows } = await pool.query('SELECT * FROM fragstund WHERE id = $1', [req.params.id])
+    res.json(rows[0])
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/admin/fragstund/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("UPDATE fragstund SET status = 'approved', approved_at = NOW() WHERE id = $1", [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.delete('/admin/fragstund/:id', requireAdmin, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM fragstund WHERE id = $1', [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
+  try {
+    // Debates missing ingress
+    const { rows: missingDebates } = await pool.query(
+      "SELECT id, dok_id, dok_type, title, date FROM debates WHERE ingress IS NULL ORDER BY date DESC LIMIT 20"
+    )
+    let updatedDebates = 0
+    for (const row of missingDebates) {
+      try {
+        const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, row.dok_type ?? 'ip')
+        if (summary) {
+          const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+          const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+          await pool.query(
+            'UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE id = $4',
+            [summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), row.id]
+          )
+          updatedDebates++
+        }
+      } catch(e) { console.error(`regenerate debate ${row.id}:`, e.message) }
+    }
+    // Fragstund missing summary
+    const { rows: missingFs } = await pool.query(
+      "SELECT id, dok_id, title, date FROM fragstund WHERE summary IS NULL ORDER BY date DESC LIMIT 20"
+    )
+    let updatedFragstund = 0
+    for (const row of missingFs) {
+      try {
+        const summary = await generateFragstundSummary(row.dok_id, row.title, row.date, apiKey)
+        if (summary) {
+          await pool.query('UPDATE fragstund SET summary = $1 WHERE id = $2', [summary, row.id])
+          updatedFragstund++
+        }
+      } catch(e) { console.error(`regenerate fragstund ${row.id}:`, e.message) }
+    }
+    res.json({ updatedDebates, updatedFragstund, totalChecked: missingDebates.length + missingFs.length })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
