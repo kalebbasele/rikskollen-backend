@@ -292,7 +292,7 @@ async function generateAndCache(dokId, title, date, apiKey, dokType = 'ip') {
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 700,
-      messages: [{ role: 'user', content: `Du är en politisk journalist. Sammanfatta denna riksdagsdebatt för unga väljare. Basera ENBART på texten nedan.\n\nViktigt: Använd ALLTID partiförkortningar (S, M, SD, KD, L, C, V, MP) direkt i texten. Skriv ALDRIG "högerblocket" eller "vänsterblocket" – nämn istället partierna vid namn.\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON:\n{"ingress":"2-3 meningar om vad debatten handlade om. Namnge partierna (t.ex. S, M, SD) direkt – aldrig 'högerblocket'/'vänsterblocket'.","vansterblocket":{"parties":["partiförkortningar som talade, t.ex. S, V, MP"],"summary":"Vad de argumenterade för, 2-4 meningar. Nämn partierna vid förkortning.","keyArg":"Deras starkaste argument, 1 mening."},"hogerblocket":{"parties":["partiförkortningar som talade, t.ex. M, SD, KD, L, C"],"summary":"Vad de argumenterade för, 2-4 meningar. Nämn partierna vid förkortning.","keyArg":"Deras starkaste argument, 1 mening."}}` }]
+      messages: [{ role: 'user', content: `Du är en politisk redaktör. Skriv en saklig och lättläst sammanfattning av riksdagsdebatten nedan, anpassad för unga väljare som vill förstå vad som faktiskt avgjordes.\n\nRegler:\n- Använd ALLTID partiförkortningar (S, M, SD, KD, L, C, V, MP) direkt i texten\n- Skriv ALDRIG "högerblocket", "vänsterblocket", "oppositionen" eller "regeringen" – nämn partierna vid namn\n- Börja INTE med "Debatten handlade om", "I denna debatt" eller liknande – gå direkt på sak\n- Skriv i aktiv form, gärna med konkreta exempel från debatten\n- Formellt men tillgängligt språk\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON:\n{"ingress":"2-3 meningar som inleder sakligt. Börja inte med 'Debatten...' – starta hellre med vad som stod på spel, vilka partier som tog position, eller vad frågan gäller.","vansterblocket":{"parties":["partiförkortningar som talade, t.ex. S, V, MP"],"summary":"Vad de argumenterade för, 2-4 meningar. Nämn partierna vid förkortning.","keyArg":"Deras starkaste argument, 1 mening."},"hogerblocket":{"parties":["partiförkortningar som talade, t.ex. M, SD, KD, L, C"],"summary":"Vad de argumenterade för, 2-4 meningar. Nämn partierna vid förkortning.","keyArg":"Deras starkaste argument, 1 mening."}}` }]
     })
   })
   const aiData = await aiRes.json()
@@ -332,7 +332,7 @@ async function parseVoteDetail(id) {
 
 async function generateVoteSummaryServer(vote, apiKey) {
   const partyBreakdown = (vote.partyVotes || []).map(pv => `${pv.party}: ${pv.ja} ja, ${pv.nej} nej`).join('\n')
-  const prompt = `Du är en politisk journalist som förklarar riksdagsbeslut konkret för unga svenska väljare.
+  const prompt = `Du är en politisk redaktör som förklarar riksdagsbeslut sakligt och tillgängligt för unga svenska väljare.
 
 Omröstning: ${vote.title}
 Datum: ${vote.date}
@@ -340,6 +340,11 @@ Resultat: ${vote.totalJa} ja, ${vote.totalNej} nej → ${vote.outcome === 'ja' ?
 
 Partier:
 ${partyBreakdown}
+
+Regler:
+- Skriv i aktiv, konkret form
+- Börja inte med "Riksdagen beslutade" eller liknande kliché – gå direkt på vad beslutet innebär
+- Formellt men tillgängligt språk
 
 Svara ENDAST med JSON:
 {"humanTitle":"[Kort fråga max 8 ord]","jaMeaning":"[Vad JA innebär konkret, en mening]","nejMeaning":"[Vad NEJ innebär konkret, en mening]","consequence":"[Vad utfallet betyder för vanliga människor, 1-2 meningar]","topicEmoji":"[ett emoji]"}`
@@ -502,7 +507,7 @@ async function generateFragstundSummary(dokId, title, date, apiKey) {
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 300,
-      messages: [{ role: 'user', content: `Du är en politisk journalist. Sammanfatta denna riksdagens frågestund i 2-3 meningar för unga väljare. Nämn vilka ämnen som togs upp och av vilka partier. Basera ENBART på texten nedan.\n\nTitel: ${title}\n\n${protocol.slice(0, 6000)}\n\nSvara ENDAST med en JSON: {"summary":"2-3 meningar om vad som diskuterades i frågestunden."}` }]
+      messages: [{ role: 'user', content: `Du är en politisk redaktör. Skriv en saklig och lättläst sammanfattning av riksdagens frågestund nedan, anpassad för unga väljare.\n\nRegler:\n- Nämn konkreta ämnen och vilka partier som tog upp dem\n- Börja INTE med "Under frågestunden" eller "Frågestunden handlade om" – gå direkt på vad som diskuterades\n- Formellt men tillgängligt språk\n- Basera ENBART på texten nedan\n\nTitel: ${title}\n\n${protocol.slice(0, 6000)}\n\nSvara ENDAST med en JSON: {"summary":"2-3 meningar som beskriver vad som togs upp. Börja inte med 'Under frågestunden' eller liknande."}` }]
     })
   })
   const aiData = await res.json()
