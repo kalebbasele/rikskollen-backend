@@ -321,7 +321,7 @@ async function generateAndCache(dokId, title, date, apiKey, dokType = 'ip') {
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 700,
-      messages: [{ role: 'user', content: `Du är en erfaren politisk reporter på en nyhetssajt. Din uppgift är att skriva en kort, intresseväckande nyhetsnotis om riksdagsdebatten nedan – som om du skriver ett nyhetsmail till läsare som snabbt vill veta vad som hände och varför det spelar roll.\n\nRegler:\n- Varje sammanfattning ska kännas unik och specifik för just denna debatt – aldrig generisk\n- Börja med det mest intressanta eller kontroversiella som framkom – en konkret ståndpunkt, ett krav, en konflikt\n- Nämn ALDRIG "högerblocket", "vänsterblocket", "oppositionen" eller "regeringen" – använd alltid partiförkortningar (S, M, SD, KD, L, C, V, MP)\n- Skriv INTE "Debatten handlade om", "I debatten", "Riksdagen diskuterade" – gå direkt på innehållet\n- Formellt men enkelt språk – inga krångliga meningar\n- Basera ENBART på texten nedan\n- VIKTIGT: Om texten nedan uppenbart handlar om ett annat ämne än titeln, svara med null istället för JSON\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON (eller null om texten inte matchar titeln):\n{"ingress":"2-3 meningar. Led med det mest konkreta från debatten – ett specifikt krav, en tydlig konflikt, eller ett oväntat svar. Namnge partier och personer när det tillför.","vansterblocket":{"parties":["partiförkortningar"],"summary":"Vad de drev för linje, med konkreta argument. 2-4 meningar.","keyArg":"Deras skarpaste argument eller krav, 1 mening."},"hogerblocket":{"parties":["partiförkortningar"],"summary":"Vad de drev för linje, med konkreta argument. 2-4 meningar.","keyArg":"Deras skarpaste argument eller krav, 1 mening."}}` }]
+      messages: [{ role: 'user', content: `Du är politisk reporter på Omni. Skriv en nyhetsnotis om riksdagsdebatten nedan på naturlig, flytande svenska.\n\nSpråkregler – följ dessa strikt:\n- Aktiv form alltid: "SD kräver" inte "ett krav ställdes av SD"\n- Max 20 ord per mening – klipp hellre än att binda ihop\n- Inga nominaliseringar: "genomföra" inte "genomförandet av"\n- Inga inledande bisatser: inte "Med anledning av" / "Till följd av" / "Vad gäller"\n- Inga klichéer: inte "lyfte fram", "påpekade att", "menade att"\n- Börja direkt med en person, ett parti eller ett konkret faktum\n\nInnehållsregler:\n- Specifikt för just denna debatt – aldrig generiskt\n- Nämn ALDRIG "högerblocket", "vänsterblocket", "oppositionen", "regeringen" – använd partiförkortningar (S, M, SD, KD, L, C, V, MP)\n- Skriv INTE "Debatten handlade om", "I debatten", "Riksdagen diskuterade"\n- Basera ENBART på texten nedan\n- Om texten uppenbart handlar om ett annat ämne än titeln: svara null\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON (eller null):\n{"ingress":"2-3 meningar. Börja med det skarpaste från debatten – ett krav, en konflikt, ett oväntat svar. Namnge partier och personer.","vansterblocket":{"parties":["partiförkortningar"],"summary":"Deras linje med konkreta argument. 2-3 meningar. Aktiv, direkt svenska.","keyArg":"Deras skarpaste krav eller argument. 1 kort mening."},"hogerblocket":{"parties":["partiförkortningar"],"summary":"Deras linje med konkreta argument. 2-3 meningar. Aktiv, direkt svenska.","keyArg":"Deras skarpaste krav eller argument. 1 kort mening."}}` }]
     })
   })
   const aiData = await aiRes.json()
@@ -1000,6 +1000,43 @@ app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
       } catch(e) { console.error(`regenerate fragstund ${row.id}:`, e.message) }
     }
     res.json({ updatedDebates, updatedFragstund, totalChecked: debateRows.length + fsRows.length })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// Regenererar ALLA debatter med ny prompt — även godkända
+app.post('/admin/regenerate-all-summaries', requireAdmin, async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, dok_id, dok_type, title, date FROM debates ORDER BY date DESC LIMIT 50"
+    )
+    res.json({ started: true, total: rows.length })
+    // Run in background after responding
+    ;(async () => {
+      let updated = 0
+      for (const row of rows) {
+        try {
+          summaryCache.delete(row.dok_id)
+          const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, row.dok_type ?? 'ip')
+          if (summary) {
+            const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+            const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+            await pool.query(
+              'UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE id = $4',
+              [summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), row.id]
+            )
+            updated++
+            console.log(`regenerate-all: updated ${updated}/${rows.length} — "${row.title}"`)
+          } else {
+            await pool.query('DELETE FROM debates WHERE id = $1', [row.id])
+            console.log(`regenerate-all: deleted "${row.title}" — no content`)
+          }
+        } catch(e) { console.error(`regenerate-all ${row.id}:`, e.message) }
+        await new Promise(r => setTimeout(r, 800)) // rate limit
+      }
+      console.log(`regenerate-all: done. ${updated} updated.`)
+    })()
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
