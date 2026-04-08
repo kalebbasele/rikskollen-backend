@@ -278,7 +278,24 @@ async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
       fetchAnforandenByTitle(title, kammaraktivitet),
     ])
     const texts = results.map(r => r.status === 'fulfilled' ? r.value : '')
-    const best = texts.filter(t => t.length >= 200).sort((a, b) => b.length - a.length)[0]
+
+    // Protocol section (index 3) is pinned to this specific debate via beteckning.
+    // If it has substantial content, always prefer it — never let a longer but
+    // potentially wrong result from fetchAnforandenByTitle override it.
+    const protocolText = texts[3]
+    if (protocolText && protocolText.length >= 300) return protocolText.slice(0, 8000)
+
+    // For the remaining strategies, only use texts that contain at least one
+    // significant word from the title (guards against cross-debate contamination).
+    const titleWords = (title || '').split(/\s+/).filter(w => w.length > 5).slice(0, 5)
+    const relevant = texts.filter((t, i) => {
+      if (i === 3) return false // already handled above
+      if (t.length < 200) return false
+      if (titleWords.length === 0) return true
+      const tLower = t.toLowerCase()
+      return titleWords.some(w => tLower.includes(w.toLowerCase()))
+    })
+    const best = relevant.sort((a, b) => b.length - a.length)[0]
     if (best) return best.slice(0, 8000)
   } catch {}
   return ''
@@ -295,12 +312,13 @@ async function generateAndCache(dokId, title, date, apiKey, dokType = 'ip') {
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 700,
-      messages: [{ role: 'user', content: `Du är en erfaren politisk reporter på en nyhetssajt. Din uppgift är att skriva en kort, intresseväckande nyhetsnotis om riksdagsdebatten nedan – som om du skriver ett nyhetsmail till läsare som snabbt vill veta vad som hände och varför det spelar roll.\n\nRegler:\n- Varje sammanfattning ska kännas unik och specifik för just denna debatt – aldrig generisk\n- Börja med det mest intressanta eller kontroversiella som framkom – en konkret ståndpunkt, ett krav, en konflikt\n- Nämn ALDRIG "högerblocket", "vänsterblocket", "oppositionen" eller "regeringen" – använd alltid partiförkortningar (S, M, SD, KD, L, C, V, MP)\n- Skriv INTE "Debatten handlade om", "I debatten", "Riksdagen diskuterade" – gå direkt på innehållet\n- Formellt men enkelt språk – inga krångliga meningar\n- Basera ENBART på texten nedan\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON:\n{"ingress":"2-3 meningar. Led med det mest konkreta från debatten – ett specifikt krav, en tydlig konflikt, eller ett oväntat svar. Namnge partier och personer när det tillför.","vansterblocket":{"parties":["partiförkortningar"],"summary":"Vad de drev för linje, med konkreta argument. 2-4 meningar.","keyArg":"Deras skarpaste argument eller krav, 1 mening."},"hogerblocket":{"parties":["partiförkortningar"],"summary":"Vad de drev för linje, med konkreta argument. 2-4 meningar.","keyArg":"Deras skarpaste argument eller krav, 1 mening."}}` }]
+      messages: [{ role: 'user', content: `Du är en erfaren politisk reporter på en nyhetssajt. Din uppgift är att skriva en kort, intresseväckande nyhetsnotis om riksdagsdebatten nedan – som om du skriver ett nyhetsmail till läsare som snabbt vill veta vad som hände och varför det spelar roll.\n\nRegler:\n- Varje sammanfattning ska kännas unik och specifik för just denna debatt – aldrig generisk\n- Börja med det mest intressanta eller kontroversiella som framkom – en konkret ståndpunkt, ett krav, en konflikt\n- Nämn ALDRIG "högerblocket", "vänsterblocket", "oppositionen" eller "regeringen" – använd alltid partiförkortningar (S, M, SD, KD, L, C, V, MP)\n- Skriv INTE "Debatten handlade om", "I debatten", "Riksdagen diskuterade" – gå direkt på innehållet\n- Formellt men enkelt språk – inga krångliga meningar\n- Basera ENBART på texten nedan\n- VIKTIGT: Om texten nedan uppenbart handlar om ett annat ämne än titeln, svara med null istället för JSON\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON (eller null om texten inte matchar titeln):\n{"ingress":"2-3 meningar. Led med det mest konkreta från debatten – ett specifikt krav, en tydlig konflikt, eller ett oväntat svar. Namnge partier och personer när det tillför.","vansterblocket":{"parties":["partiförkortningar"],"summary":"Vad de drev för linje, med konkreta argument. 2-4 meningar.","keyArg":"Deras skarpaste argument eller krav, 1 mening."},"hogerblocket":{"parties":["partiförkortningar"],"summary":"Vad de drev för linje, med konkreta argument. 2-4 meningar.","keyArg":"Deras skarpaste argument eller krav, 1 mening."}}` }]
     })
   })
   const aiData = await aiRes.json()
-  const text = aiData.content?.[0]?.text ?? ''
-  const result = JSON.parse(text.replace(/```json|```/g, '').trim())
+  const text = (aiData.content?.[0]?.text ?? '').replace(/```json|```/g, '').trim()
+  if (text === 'null' || text === '') return null
+  const result = JSON.parse(text)
   summaryCache.set(dokId, result)
   return result
 }
