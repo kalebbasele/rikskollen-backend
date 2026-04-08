@@ -140,6 +140,28 @@ async function fetchAnforanden(url) {
   } catch { return '' }
 }
 
+// Hämtar anföranden direkt från dokumentets inbäddade debatt-data.
+// Detta är den mest tillförlitliga källan — garanterat kopplad till rätt debatt.
+async function fetchAnforandenFromDokument(dokId) {
+  try {
+    const res = await fetch(`https://data.riksdagen.se/dokument/${dokId}?utformat=json`)
+    const data = await res.json()
+    const anforanden = data?.dokumentstatus?.dokument?.debatt?.anforande ?? []
+    const arr = Array.isArray(anforanden) ? anforanden : [anforanden]
+    if (arr.length === 0) return ''
+    const results = await Promise.allSettled(
+      arr.slice(0, 8).map(async a => {
+        if (!a.anforande_url_html) return ''
+        const r = await fetch(a.anforande_url_html)
+        const html = await r.text()
+        const text = stripTags(html).trim()
+        return text.length > 50 ? `[${a.talare} (${a.parti})]: ${text.slice(0, 1500)}` : ''
+      })
+    )
+    return results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value).join('\n\n')
+  } catch { return '' }
+}
+
 async function fetchAnforandenByHtml(dokId) {
   try {
     const [r1, r2] = await Promise.all([
@@ -270,6 +292,14 @@ async function fetchAnforandenByTitle(title, kammaraktivitet = '') {
 
 async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
   try {
+    // Strategy 0: fetch speeches directly from the document's embedded debate data.
+    // This is the only source guaranteed to be linked to exactly this debate.
+    const fromDok = await fetchAnforandenFromDokument(dokId)
+    if (fromDok && fromDok.length >= 200) {
+      console.log(`fetchDebateText: got ${fromDok.length} chars from dokument/${dokId}`)
+      return fromDok.slice(0, 8000)
+    }
+
     const results = await Promise.allSettled([
       fetchAnforanden(`https://data.riksdagen.se/anforandelista/?rel_dok_id=${dokId}&utformat=json&antal=20`),
       fetchAnforanden(`https://data.riksdagen.se/anforandelista/?dokid=${dokId}&utformat=json&antal=20`),
