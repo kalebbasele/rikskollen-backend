@@ -222,7 +222,7 @@ function findBestSectionInProtocol(clean, searchTerms) {
       if (searchFrom >= clean.length) break
     }
     if (bestIdx >= 0) {
-      const section = clean.slice(Math.max(0, bestIdx - 500), bestIdx + 20000)
+      const section = clean.slice(Math.max(0, bestIdx - 2000), bestIdx + 20000)
       if (section.length >= 200) return section
     }
   }
