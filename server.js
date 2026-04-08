@@ -826,14 +826,34 @@ app.post('/admin/fix-vote-dokids', requireAdmin, async (req, res) => {
 app.post('/admin/debates/reset-summary', requireAdmin, async (req, res) => {
   const { dokId } = req.body
   if (!dokId) return res.status(400).json({ error: 'dokId required' })
+  const apiKey = process.env.ANTHROPIC_API_KEY
   try {
     summaryCache.delete(dokId)
-    const result = await pool.query(
-      'UPDATE debates SET ingress = NULL, left_bloc = NULL, right_bloc = NULL WHERE dok_id = $1',
-      [dokId]
-    )
-    if (result.rowCount === 0) return res.status(404).json({ error: 'Debate not found' })
-    res.json({ ok: true, reset: dokId })
+    const { rows } = await pool.query('SELECT id, dok_id, dok_type, title, date FROM debates WHERE dok_id = $1', [dokId])
+    if (rows.length === 0) return res.status(404).json({ error: 'Debate not found' })
+    const row = rows[0]
+
+    if (!apiKey) {
+      // No API key — just null the ingress so it gets retried later
+      await pool.query('UPDATE debates SET ingress = NULL, left_bloc = NULL, right_bloc = NULL WHERE dok_id = $1', [dokId])
+      return res.json({ ok: true, action: 'reset' })
+    }
+
+    const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, row.dok_type ?? 'ip')
+    if (summary) {
+      const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+      const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+      await pool.query(
+        'UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE id = $4',
+        [summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), row.id]
+      )
+      res.json({ ok: true, action: 'updated' })
+    } else {
+      // No content (no speakers / wrong debate) — delete it
+      await pool.query('DELETE FROM debates WHERE id = $1', [row.id])
+      console.log(`reset-summary: deleted "${row.title}" — no debate content`)
+      res.json({ ok: true, action: 'deleted' })
+    }
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
@@ -959,6 +979,10 @@ app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
             [summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), row.id]
           )
           updatedDebates++
+        } else {
+          // No content found — delete the row entirely
+          await pool.query('DELETE FROM debates WHERE id = $1', [row.id])
+          console.log(`regenerate: deleted "${row.title}" — no debate content`)
         }
       } catch(e) { console.error(`regenerate debate ${row.id}:`, e.message) }
     }
