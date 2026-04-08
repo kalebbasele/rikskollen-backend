@@ -279,28 +279,33 @@ async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
     ])
     const texts = results.map(r => r.status === 'fulfilled' ? r.value : '')
 
-    // Protocol section (index 3) is pinned to this specific debate via beteckning.
-    // If it has substantial content, always prefer it — never let a longer but
-    // potentially wrong result from fetchAnforandenByTitle override it.
-    const protocolText = texts[3]
+    // The most distinctive word from the title (longest, >5 chars).
+    // Every candidate text MUST contain this word — otherwise it's from the wrong debate.
+    const titleWords = (title || '').split(/\s+/).filter(w => w.length > 5)
+    const distinctWord = titleWords.sort((a, b) => b.length - a.length)[0] ?? ''
 
-    // Detect debates where no speakers registered — must be caught BEFORE the length
-    // threshold so we don't fall through to wrong content from another debate.
+    function containsDistinctWord(t) {
+      if (!distinctWord) return true
+      return t.toLowerCase().includes(distinctWord.toLowerCase())
+    }
+
+    // Detect debates where no speakers registered
+    const protocolText = texts[3]
     if (protocolText && /ingen talare var anm/i.test(protocolText)) {
       return '__NO_SPEAKERS__'
     }
 
-    if (protocolText && protocolText.length >= 300) return protocolText.slice(0, 8000)
+    // Protocol section preferred — but only if the distinct title word is actually in it.
+    // This prevents the TOC-grab bug where 20 000 chars after a TOC entry contains wrong debate.
+    if (protocolText && protocolText.length >= 300 && containsDistinctWord(protocolText)) {
+      return protocolText.slice(0, 8000)
+    }
 
-    // For the remaining strategies, only use texts that contain at least one
-    // significant word from the title (guards against cross-debate contamination).
-    const titleWords = (title || '').split(/\s+/).filter(w => w.length > 5).slice(0, 5)
+    // Remaining strategies: must contain the distinct title word
     const relevant = texts.filter((t, i) => {
-      if (i === 3) return false // already handled above
+      if (i === 3) return false
       if (t.length < 200) return false
-      if (titleWords.length === 0) return true
-      const tLower = t.toLowerCase()
-      return titleWords.some(w => tLower.includes(w.toLowerCase()))
+      return containsDistinctWord(t)
     })
     const best = relevant.sort((a, b) => b.length - a.length)[0]
     if (best) return best.slice(0, 8000)
