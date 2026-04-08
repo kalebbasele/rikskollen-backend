@@ -255,30 +255,24 @@ async function fetchProtocolSection(date, title, dokId = '') {
   return ''
 }
 
-// Söker anföranden via nyckelord i titeln — hittar debatten även om dok_id-kopplingen saknas
-async function fetchAnforandenByTitle(title, kammaraktivitet = '') {
+// Hämtar alla anföranden från protokollet för debattdagen och filtrerar på titelnyckelord.
+// Mer tillförlitlig än fetchAnforandenByTitle som söker brett över 6 månader.
+async function fetchAnforandenFromProtocol(date, title) {
   try {
-    const words = (title || '').split(/\s+/).filter(w => w.length > 4).slice(0, 4)
-    if (words.length === 0) return ''
-    const today = new Date()
-    const from = new Date(today); from.setMonth(from.getMonth() - 6)
-    const fromStr = from.toISOString().slice(0, 10).replace(/-/g, '')
-    const tomStr = today.toISOString().slice(0, 10).replace(/-/g, '')
-    const kamUrl = kammaraktivitet ? `&kammaraktivitet=${encodeURIComponent(kammaraktivitet)}` : ''
-    const res = await fetch(
-      `https://data.riksdagen.se/anforandelista/?utformat=json&antal=200&from=${fromStr}&tom=${tomStr}${kamUrl}`
-    )
+    const dateStr = date.replace(/-/g, '')
+    const res = await fetch(`https://data.riksdagen.se/anforandelista/?utformat=json&antal=200&from=${dateStr}&tom=${dateStr}`)
     const data = await res.json()
     const list = data?.anforandelista?.anforande ?? []
     const arr = Array.isArray(list) ? list : [list]
+    const words = (title || '').split(/\s+/).filter(w => w.length > 4)
     const relevant = arr.filter(a => {
       const rubrik = ((a.avsnittsrubrik || '') + ' ' + (a.kammaraktivitet || '')).toLowerCase()
       return words.some(w => rubrik.includes(w.toLowerCase()))
     })
     if (relevant.length === 0) return ''
-    console.log(`fetchAnforandenByTitle(${kammaraktivitet}): ${relevant.length} träffar för "${words.join(' ')}"`)
+    console.log(`fetchAnforandenFromProtocol: ${relevant.length} träffar för "${title}" (${date})`)
     const results = await Promise.allSettled(
-      relevant.slice(0, 8).map(async a => {
+      relevant.slice(0, 10).map(async a => {
         if (!a.anforande_url_html) return ''
         const r = await fetch(a.anforande_url_html)
         const html = await r.text()
@@ -287,7 +281,7 @@ async function fetchAnforandenByTitle(title, kammaraktivitet = '') {
       })
     )
     return results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value).join('\n\n')
-  } catch(e) { console.error('fetchAnforandenByTitle error:', e.message); return '' }
+  } catch(e) { console.error('fetchAnforandenFromProtocol error:', e.message); return '' }
 }
 
 async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
@@ -305,7 +299,7 @@ async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
       fetchAnforanden(`https://data.riksdagen.se/anforandelista/?dokid=${dokId}&utformat=json&antal=20`),
       fetchAnforandenByHtml(dokId),
       date ? fetchProtocolSection(date, title, dokId) : Promise.resolve(''),
-      fetchAnforandenByTitle(title, kammaraktivitet),
+      date ? fetchAnforandenFromProtocol(date, title) : Promise.resolve(''),
     ])
     const texts = results.map(r => r.status === 'fulfilled' ? r.value : '')
 
