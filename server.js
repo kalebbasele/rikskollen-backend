@@ -100,7 +100,11 @@ function requireAdmin(req, res, next) {
 // ── Text helpers ──────────────────────────────────────────────────────────────
 
 function stripTags(s) {
-  return (s ?? '').replace(/<[^>]*>/g, ' ').replace(/&[a-z#0-9]+;/gi, ' ').replace(/\s+/g, ' ').trim()
+  return (s ?? '')
+    .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')  // decode entity-encoded HTML before stripping
+    .replace(/<[^>]*>/g, ' ')                        // strip all tags
+    .replace(/&[a-z#0-9]+;/gi, ' ')                 // remove remaining entities (&amp; &nbsp; etc.)
+    .replace(/\s+/g, ' ').trim()
 }
 
 function cleanName(raw) {
@@ -271,7 +275,6 @@ async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
       fetchAnforanden(`https://data.riksdagen.se/anforandelista/?dokid=${dokId}&utformat=json&antal=20`),
       fetchAnforandenByHtml(dokId),
       date ? fetchProtocolSection(date, title, dokId) : Promise.resolve(''),
-      fetch(`https://data.riksdagen.se/dokument/${dokId}.text`).then(r => r.text()).then(stripTags).catch(() => ''),
       fetchAnforandenByTitle(title, kammaraktivitet),
     ])
     const texts = results.map(r => r.status === 'fulfilled' ? r.value : '')
