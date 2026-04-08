@@ -291,7 +291,7 @@ async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
     const fromDok = await fetchAnforandenFromDokument(dokId)
     if (fromDok && fromDok.length >= 200) {
       console.log(`fetchDebateText: got ${fromDok.length} chars from dokument/${dokId}`)
-      return fromDok.slice(0, 8000)
+      return fromDok.slice(0, 18000)
     }
 
     const results = await Promise.allSettled([
@@ -322,7 +322,7 @@ async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
     // Protocol section preferred — but only if the distinct title word is actually in it.
     // This prevents the TOC-grab bug where 20 000 chars after a TOC entry contains wrong debate.
     if (protocolText && protocolText.length >= 300 && containsDistinctWord(protocolText)) {
-      return protocolText.slice(0, 8000)
+      return protocolText.slice(0, 18000)
     }
 
     // Remaining strategies: must contain the distinct title word
@@ -332,7 +332,7 @@ async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
       return containsDistinctWord(t)
     })
     const best = relevant.sort((a, b) => b.length - a.length)[0]
-    if (best) return best.slice(0, 8000)
+    if (best) return best.slice(0, 18000)
   } catch {}
   return ''
 }
