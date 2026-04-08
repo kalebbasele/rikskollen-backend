@@ -884,14 +884,17 @@ app.delete('/admin/fragstund/:id', requireAdmin, async (req, res) => {
 app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY
   if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
+  const force = req.query.force === 'true'
   try {
-    // Debates missing ingress
-    const { rows: missingDebates } = await pool.query(
-      "SELECT id, dok_id, dok_type, title, date FROM debates WHERE ingress IS NULL ORDER BY date DESC LIMIT 20"
-    )
+    const debateQuery = force
+      ? "SELECT id, dok_id, dok_type, title, date FROM debates ORDER BY date DESC LIMIT 20"
+      : "SELECT id, dok_id, dok_type, title, date FROM debates WHERE ingress IS NULL ORDER BY date DESC LIMIT 20"
+    const { rows: debateRows } = await pool.query(debateQuery)
     let updatedDebates = 0
-    for (const row of missingDebates) {
+    for (const row of debateRows) {
       try {
+        // Clear cache so old result doesn't block re-generation
+        summaryCache.delete(row.dok_id)
         const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, row.dok_type ?? 'ip')
         if (summary) {
           const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
@@ -904,12 +907,12 @@ app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
         }
       } catch(e) { console.error(`regenerate debate ${row.id}:`, e.message) }
     }
-    // Fragstund missing summary
-    const { rows: missingFs } = await pool.query(
-      "SELECT id, dok_id, title, date FROM fragstund WHERE summary IS NULL ORDER BY date DESC LIMIT 20"
-    )
+    const fsQuery = force
+      ? "SELECT id, dok_id, title, date FROM fragstund ORDER BY date DESC LIMIT 20"
+      : "SELECT id, dok_id, title, date FROM fragstund WHERE summary IS NULL ORDER BY date DESC LIMIT 20"
+    const { rows: fsRows } = await pool.query(fsQuery)
     let updatedFragstund = 0
-    for (const row of missingFs) {
+    for (const row of fsRows) {
       try {
         const summary = await generateFragstundSummary(row.dok_id, row.title, row.date, apiKey)
         if (summary) {
@@ -918,7 +921,7 @@ app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
         }
       } catch(e) { console.error(`regenerate fragstund ${row.id}:`, e.message) }
     }
-    res.json({ updatedDebates, updatedFragstund, totalChecked: missingDebates.length + missingFs.length })
+    res.json({ updatedDebates, updatedFragstund, totalChecked: debateRows.length + fsRows.length })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
