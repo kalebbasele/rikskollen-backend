@@ -283,6 +283,13 @@ async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
     // If it has substantial content, always prefer it — never let a longer but
     // potentially wrong result from fetchAnforandenByTitle override it.
     const protocolText = texts[3]
+
+    // Detect debates where no speakers registered — must be caught BEFORE the length
+    // threshold so we don't fall through to wrong content from another debate.
+    if (protocolText && /ingen talare var anm/i.test(protocolText)) {
+      return '__NO_SPEAKERS__'
+    }
+
     if (protocolText && protocolText.length >= 300) return protocolText.slice(0, 8000)
 
     // For the remaining strategies, only use texts that contain at least one
@@ -305,7 +312,9 @@ async function generateAndCache(dokId, title, date, apiKey, dokType = 'ip') {
   if (summaryCache.has(dokId)) return summaryCache.get(dokId)
   const kammaraktivitet = dokType === 'bet' ? 'betankandedebatt' : 'interpellationsdebatt'
   const protocol = await fetchDebateText(dokId, date, title, kammaraktivitet)
-  if (!protocol || protocol.length < 100) return null
+
+  // No speakers registered — this debate has no content to summarize, exclude it entirely
+  if (protocol === '__NO_SPEAKERS__' || !protocol || protocol.length < 100) return null
   const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
@@ -620,12 +629,16 @@ async function runAutoFetch() {
               [ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), debate.id]
             )
             console.log(`Auto-fetch: filled in missing summary for "${debate.title}"`)
+          } else {
+            // Still no content (no speakers / protocol mismatch) — remove the row
+            await pool.query('DELETE FROM debates WHERE id = $1', [existing.rows[0].id])
+            console.log(`Auto-fetch: deleted "${debate.title}" — no debate content`)
           }
         } catch(e) { console.error(`AI retry failed ${debate.id}:`, e.message) }
         continue
       }
 
-      // New debate — generate summary and insert
+      // New debate — generate summary and insert only if content exists
       let ingress = null, leftBloc = null, rightBloc = null
       try {
         const summary = await generateAndCache(debate.dokId, debate.title, debate.date, apiKey, debate.dokType ?? 'ip')
@@ -633,8 +646,12 @@ async function runAutoFetch() {
           ingress = summary.ingress
           leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
           rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+        } else {
+          // No summary means no speakers / no debate content — skip entirely
+          console.log(`Auto-fetch: skipping "${debate.title}" — no debate content found`)
+          continue
         }
-      } catch(e) { console.error(`AI debate failed ${debate.id}:`, e.message) }
+      } catch(e) { console.error(`AI debate failed ${debate.id}:`, e.message); continue }
 
       await pool.query(
         `INSERT INTO debates (id, dok_id, dok_type, title, topic, topic_emoji, date, venue, participants, ingress, left_bloc, right_bloc, status)
@@ -802,6 +819,21 @@ app.post('/admin/fix-vote-dokids', requireAdmin, async (req, res) => {
       updated += result.rowCount
     }
     res.json({ updated })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// Reset a debate's summary so it gets regenerated on the next auto-fetch cycle
+app.post('/admin/debates/reset-summary', requireAdmin, async (req, res) => {
+  const { dokId } = req.body
+  if (!dokId) return res.status(400).json({ error: 'dokId required' })
+  try {
+    summaryCache.delete(dokId)
+    const result = await pool.query(
+      'UPDATE debates SET ingress = NULL, left_bloc = NULL, right_bloc = NULL WHERE dok_id = $1',
+      [dokId]
+    )
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Debate not found' })
+    res.json({ ok: true, reset: dokId })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
