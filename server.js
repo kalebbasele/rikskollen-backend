@@ -344,13 +344,18 @@ Resultat: ${vote.totalJa} ja, ${vote.totalNej} nej → ${vote.outcome === 'ja' ?
 Partier:
 ${partyBreakdown}
 
-Regler:
-- Skriv i aktiv, konkret form
-- Börja inte med "Riksdagen beslutade" eller liknande kliché – gå direkt på vad beslutet innebär
-- Formellt men tillgängligt språk
+De fyra fälten ska vara tydligt olika från varandra och inte upprepa samma information:
+
+humanTitle: En kort, engagerande fråga (max 8 ord) som fångar kärnan i vad omröstningen gällde.
+
+jaMeaning: Beskriv konkret vad en JA-röst stödde – den faktiska policyn eller förändringen, inte bara "förslaget godkänns". En mening.
+
+nejMeaning: Beskriv vad en NEJ-röst stödde – vad som hade bevarats eller vilket alternativ man föredrog. Får INTE vara en spegelbild av jaMeaning med "avslås" inbytt. En mening.
+
+consequence: Vad utfallet faktiskt innebär framåt för vanliga människor – konkret och framåtblickande. Ska tillföra ny information som inte redan finns i jaMeaning eller nejMeaning. Börja inte med "Det innebär att" eller "Riksdagen beslutade". 1–2 meningar.
 
 Svara ENDAST med JSON:
-{"humanTitle":"[Kort fråga max 8 ord]","jaMeaning":"[Vad JA innebär konkret, en mening]","nejMeaning":"[Vad NEJ innebär konkret, en mening]","consequence":"[Vad utfallet betyder för vanliga människor, 1-2 meningar]","topicEmoji":"[ett emoji]"}`
+{"humanTitle":"...","jaMeaning":"...","nejMeaning":"...","consequence":"...","topicEmoji":"[ett relevant emoji]"}`
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
