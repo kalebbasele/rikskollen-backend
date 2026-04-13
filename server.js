@@ -141,9 +141,12 @@ function extractIPSections(protText) {
     const after = protText.slice(m.index, m.index + 600)
     if (!/Anf\./i.test(after)) continue
 
-    // Extract IP numbers (e.g. "2025/26:356" → "356", or just "356")
-    const ipNumbers = (m[1].match(/\d+/g) || [])
-      .map(Number).filter(n => n >= 100 && n < 10000).map(String)
+    // Extract IP numbers from "2025/26:356" format → "356"
+    // Must parse after colon to avoid capturing the year (2025) as a number
+    const ipNumbers = []
+    const rmPattern = /\d{4}\/\d{2}:(\d+)/g
+    let rm2
+    while ((rm2 = rmPattern.exec(m[1])) !== null) ipNumbers.push(rm2[1])
     if (!ipNumbers.length) continue
 
     // Include context before the heading (speaker labels appear before section header)
