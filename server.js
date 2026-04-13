@@ -338,8 +338,9 @@ async function saveIPDebatesFromProtocols(apiKey) {
       const protData = await protRes.json()
       const prots = protData?.dokumentlista?.dokument ?? []
       const protArr = Array.isArray(prots) ? prots : [prots]
-      const prot = protArr.find(p => p?.dok_id) ?? null
-      if (!prot) { console.log(`No protocol found for ${debateDate}`); continue }
+      // Must match the exact debate date — API may return unrelated protocols if date has no protocol yet
+      const prot = protArr.find(p => p?.dok_id && p.datum === debateDate) ?? null
+      if (!prot) { console.log(`No protocol for ${debateDate} (not published yet?)`); continue }
 
       const textRes = await fetchWithTimeout(`https://data.riksdagen.se/dokument/${prot.dok_id}.text`, 15000)
       const raw = await textRes.text()
