@@ -290,6 +290,23 @@ async function saveIPDebatesFromProtocols(apiKey) {
   const cutoff = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10)
   console.log(`saveIPDebatesFromProtocols: fetching IPs for rm=${rm} since ${cutoff}`)
 
+  // 0. Pre-build a map of date → protocol dok_id for the entire riksmöte (paginate all ~6 pages)
+  const protDateMap = new Map()
+  for (let page = 1; page <= 10; page++) {
+    try {
+      const res = await fetchWithTimeout(
+        `https://data.riksdagen.se/dokumentlista/?doktyp=prot&rm=${encodeURIComponent(rm)}&utformat=json&antal=200&sort=datum&sortorder=desc&p=${page}`,
+        12000
+      )
+      const data = await res.json()
+      const docs = data?.dokumentlista?.dokument ?? []
+      const arr = Array.isArray(docs) ? docs : [docs]
+      if (!arr.length || !arr[0]?.dok_id) break
+      for (const p of arr) { if (p?.dok_id && p.datum) protDateMap.set(p.datum, p.dok_id) }
+    } catch (e) { console.error(`Protocol list page ${page} failed:`, e.message); break }
+  }
+  console.log(`saveIPDebatesFromProtocols: ${protDateMap.size} protocols in date map`)
+
   // 1. Paginate through all IP documents for this riksmöte
   const allIPDocs = []
   for (let page = 1; page <= 30; page++) {
@@ -325,24 +342,15 @@ async function saveIPDebatesFromProtocols(apiKey) {
 
   // 3. For each debate date, fetch the protocol text once then process all IPs
   for (const [debateDate, ipDocs] of byDate) {
-    const dateStr = debateDate.replace(/-/g, '')
     console.log(`Processing ${debateDate}: ${ipDocs.length} IPs`)
 
-    // Fetch the protocol for this date
+    // Fetch the protocol for this date using the pre-built map
     let protText = ''
     try {
-      const protRes = await fetchWithTimeout(
-        `https://data.riksdagen.se/dokumentlista/?doktyp=prot&from=${dateStr}&tom=${dateStr}&utformat=json&antal=5`,
-        12000
-      )
-      const protData = await protRes.json()
-      const prots = protData?.dokumentlista?.dokument ?? []
-      const protArr = Array.isArray(prots) ? prots : [prots]
-      // Must match the exact debate date — API may return unrelated protocols if date has no protocol yet
-      const prot = protArr.find(p => p?.dok_id && p.datum === debateDate) ?? null
-      if (!prot) { console.log(`No protocol for ${debateDate} (not published yet?)`); continue }
+      const protDokId = protDateMap.get(debateDate)
+      if (!protDokId) { console.log(`No protocol for ${debateDate} (not published yet?)`); continue }
 
-      const textRes = await fetchWithTimeout(`https://data.riksdagen.se/dokument/${prot.dok_id}.text`, 15000)
+      const textRes = await fetchWithTimeout(`https://data.riksdagen.se/dokument/${protDokId}.text`, 15000)
       const raw = await textRes.text()
       protText = stripTags(raw)
     } catch (e) {
