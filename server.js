@@ -865,6 +865,30 @@ app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+// Radera alla debatter och kör pipeline från scratch
+app.post('/admin/debates/clear-and-refetch', requireAdmin, async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
+  try {
+    const { rowCount } = await pool.query('DELETE FROM debates')
+    summaryCache.clear()
+    console.log(`clear-and-refetch: deleted ${rowCount} debates, starting pipeline...`)
+    res.json({ ok: true, deleted: rowCount, message: 'Pipeline started in background' })
+    // Run pipeline in background
+    saveIPDebatesFromProtocols(apiKey)
+      .then(() => console.log('clear-and-refetch: pipeline done'))
+      .catch(e => console.error('clear-and-refetch pipeline error:', e.message))
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// Trigga auto-fetch manuellt utan att rensa
+app.post('/admin/run-autofetch', requireAdmin, async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
+  res.json({ ok: true, message: 'Auto-fetch started in background' })
+  runAutoFetch().catch(e => console.error('manual autofetch error:', e.message))
+})
+
 // Regenererar ALLA debatter med ny prompt — även godkända
 app.post('/admin/regenerate-all-summaries', requireAdmin, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY
