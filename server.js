@@ -737,6 +737,47 @@ app.post('/admin/fix-vote-dokids', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+// Force-save a specific IP debate by dok_id (for debates missed by pipeline)
+app.post('/admin/debates/force-save', requireAdmin, async (req, res) => {
+  const { dokId } = req.body
+  if (!dokId) return res.status(400).json({ error: 'dokId required' })
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
+  try {
+    // Fetch IP document metadata
+    const ipRes = await fetchWithTimeout(`https://data.riksdagen.se/dokumentlista/?doktyp=ip&dokid=${dokId}&utformat=json&antal=5`, 12000)
+    const ipData = await ipRes.json()
+    const ipDocs = ipData?.dokumentlista?.dokument ?? []
+    const ipArr = Array.isArray(ipDocs) ? ipDocs : [ipDocs]
+    const ipDoc = ipArr.find(d => d.dok_id === dokId) ?? ipArr[0] ?? null
+    if (!ipDoc) return res.status(404).json({ error: 'IP document not found' })
+
+    const debateDate = ipDoc.debattdag || ''
+    if (!debateDate) return res.status(400).json({ error: 'No debattdag on IP document' })
+
+    const participants = buildParticipantsFromIntressenter(ipDoc.dokintressent)
+    if (!participants.length) return res.status(400).json({ error: 'No participants found' })
+
+    summaryCache.delete(dokId)
+    const debateText = await fetchIPSectionForDebate(dokId, debateDate, ipDoc.titel || '')
+    if (!debateText) return res.status(404).json({ error: 'No protocol section found' })
+
+    const summary = await generateAndCache(dokId, ipDoc.titel || '', debateDate, apiKey, debateText)
+    if (!summary) return res.status(500).json({ error: 'AI returned null' })
+
+    const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+    const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+
+    await pool.query(
+      `INSERT INTO debates (id, dok_id, dok_type, title, topic, topic_emoji, date, venue, participants, ingress, left_bloc, right_bloc, status)
+       VALUES ($1,$2,'ip',$3,'Interpellationsdebatt','',$4,'Riksdagens kammare',$5,$6,$7,$8,'pending')
+       ON CONFLICT (id) DO UPDATE SET ingress=$6, left_bloc=$7, right_bloc=$8`,
+      [dokId, dokId, ipDoc.titel || dokId, debateDate, JSON.stringify(participants), summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc)]
+    )
+    res.json({ ok: true, dokId, title: ipDoc.titel, date: debateDate })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 // Reset a debate's summary — fetches protocol section and regenerates
 app.post('/admin/debates/reset-summary', requireAdmin, async (req, res) => {
   const { dokId } = req.body
