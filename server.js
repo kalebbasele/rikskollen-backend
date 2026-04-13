@@ -284,95 +284,130 @@ async function generateAndCache(dokId, title, date, apiKey, debateText = '') {
   return result
 }
 
-// New main pipeline: scan protocols for IP debates and save to DB
+// New main pipeline: fetch IP documents → group by debattdag → fetch each protocol once
 async function saveIPDebatesFromProtocols(apiKey) {
-  const tom = new Date().toISOString().slice(0, 10).replace(/-/g, '')
-  const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10).replace(/-/g, '')
+  const rm = '2025/26'
+  const cutoff = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10)
+  console.log(`saveIPDebatesFromProtocols: fetching IPs for rm=${rm} since ${cutoff}`)
 
-  const protRes = await fetchWithTimeout(
-    `https://data.riksdagen.se/dokumentlista/?doktyp=prot&from=${from90}&tom=${tom}&utformat=json&antal=100`,
-    15000
-  )
-  const protData = await protRes.json()
-  const rawProts = protData?.dokumentlista?.dokument ?? []
-  const protArr = (Array.isArray(rawProts) ? rawProts : [rawProts]).filter(p => p?.dok_id)
-  console.log(`saveIPDebatesFromProtocols: found ${protArr.length} protocols`)
+  // 1. Paginate through all IP documents for this riksmöte
+  const allIPDocs = []
+  for (let page = 1; page <= 30; page++) {
+    try {
+      const res = await fetchWithTimeout(
+        `https://data.riksdagen.se/dokumentlista/?doktyp=ip&rm=${encodeURIComponent(rm)}&utformat=json&antal=200&sort=debattdag&sortorder=desc&p=${page}`,
+        12000
+      )
+      const data = await res.json()
+      const docs = data?.dokumentlista?.dokument ?? []
+      const arr = Array.isArray(docs) ? docs : [docs]
+      if (!arr.length || !arr[0]?.dok_id) break
+      // Only keep ones with debattdag within the last 90 days
+      const recent = arr.filter(d => d.debattdag && d.debattdag >= cutoff)
+      allIPDocs.push(...recent)
+      // If the earliest on this page is older than cutoff, stop
+      const earliest = arr[arr.length - 1]?.debattdag ?? ''
+      if (earliest && earliest < cutoff) break
+    } catch (e) {
+      console.error(`IP list page ${page} failed:`, e.message)
+      break
+    }
+  }
+  console.log(`saveIPDebatesFromProtocols: ${allIPDocs.length} recent IP docs found`)
 
-  for (const prot of protArr) {
-    const protDate = (prot.datum || '').slice(0, 10)
-    const rm = prot.rm || '2025/26'
+  // 2. Group IPs by debattdag
+  const byDate = new Map()
+  for (const doc of allIPDocs) {
+    const date = doc.debattdag
+    if (!byDate.has(date)) byDate.set(date, [])
+    byDate.get(date).push(doc)
+  }
 
+  // 3. For each debate date, fetch the protocol text once then process all IPs
+  for (const [debateDate, ipDocs] of byDate) {
+    const dateStr = debateDate.replace(/-/g, '')
+    console.log(`Processing ${debateDate}: ${ipDocs.length} IPs`)
+
+    // Fetch the protocol for this date
     let protText = ''
     try {
+      const protRes = await fetchWithTimeout(
+        `https://data.riksdagen.se/dokumentlista/?doktyp=prot&from=${dateStr}&tom=${dateStr}&utformat=json&antal=5`,
+        12000
+      )
+      const protData = await protRes.json()
+      const prots = protData?.dokumentlista?.dokument ?? []
+      const protArr = Array.isArray(prots) ? prots : [prots]
+      const prot = protArr.find(p => p?.dok_id) ?? null
+      if (!prot) { console.log(`No protocol found for ${debateDate}`); continue }
+
       const textRes = await fetchWithTimeout(`https://data.riksdagen.se/dokument/${prot.dok_id}.text`, 15000)
       const raw = await textRes.text()
       protText = stripTags(raw)
     } catch (e) {
-      console.error(`Protocol text fetch failed ${prot.dok_id}:`, e.message)
+      console.error(`Protocol fetch failed for ${debateDate}:`, e.message)
       continue
     }
 
     const sections = extractIPSections(protText)
-    if (!sections.length) continue
-    console.log(`Protocol ${prot.dok_id} (${protDate}): ${sections.length} IP sections`)
+    console.log(`  Protocol has ${sections.length} IP sections`)
 
-    for (const section of sections) {
-      for (const ipNum of section.ipNumbers) {
-        try {
-          const ipDoc = await fetchIPDocFromAPI(rm, ipNum)
-          if (!ipDoc) { console.log(`No IP doc found for ${rm}:${ipNum}`); continue }
-          const dokId = ipDoc.dok_id
-          if (!dokId) continue
+    // 4. For each IP document, find its section and generate summary
+    for (const ipDoc of ipDocs) {
+      const dokId = ipDoc.dok_id
+      if (!dokId) continue
+      const ipNummer = String(ipDoc.nummer || '')
 
-          const existing = await pool.query('SELECT id, ingress FROM debates WHERE dok_id = $1', [dokId])
+      try {
+        const existing = await pool.query('SELECT id, ingress FROM debates WHERE dok_id = $1', [dokId])
+        if (existing.rows.length > 0 && existing.rows[0].ingress) continue // already done
+
+        // Find the matching section
+        const section = sections.find(s => s.ipNumbers.includes(ipNummer))
+        if (!section) { console.log(`  No protocol section for IP ${ipNummer} (${ipDoc.titel?.slice(0, 40)})`); continue }
+
+        const participants = buildParticipantsFromIntressenter(ipDoc.dokintressent)
+        if (!participants.length) { console.log(`  No participants for ${dokId}`); continue }
+
+        summaryCache.delete(dokId)
+        const summary = await generateAndCache(dokId, ipDoc.titel || '', debateDate, apiKey, section.sectionText)
+
+        if (!summary) {
           if (existing.rows.length > 0) {
-            // Already saved — retry AI only if ingress is still missing
-            if (existing.rows[0].ingress) continue
-            summaryCache.delete(dokId)
-            const summary = await generateAndCache(dokId, ipDoc.titel || '', protDate, apiKey, section.sectionText)
-            if (summary) {
-              const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
-              const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
-              await pool.query(
-                'UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE dok_id = $4',
-                [summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), dokId]
-              )
-              console.log(`saveIPDebates: filled missing summary for "${ipDoc.titel}"`)
-            } else {
-              await pool.query('DELETE FROM debates WHERE dok_id = $1', [dokId])
-              console.log(`saveIPDebates: deleted "${ipDoc.titel}" — no content`)
-            }
-            continue
+            await pool.query('DELETE FROM debates WHERE dok_id = $1', [dokId])
+            console.log(`  Deleted ${dokId} — no content`)
+          } else {
+            console.log(`  Skipping ${dokId} — no content`)
           }
+          continue
+        }
 
-          const participants = buildParticipantsFromIntressenter(ipDoc.dokintressent)
-          if (!participants.length) { console.log(`No participants for ${dokId}`); continue }
+        const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+        const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
 
-          summaryCache.delete(dokId)
-          const summary = await generateAndCache(dokId, ipDoc.titel || '', protDate, apiKey, section.sectionText)
-          if (!summary) {
-            console.log(`saveIPDebates: skipping ${dokId} — no content`)
-            continue
-          }
-
-          const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
-          const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
-
+        if (existing.rows.length > 0) {
+          await pool.query(
+            'UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE dok_id = $4',
+            [summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), dokId]
+          )
+          console.log(`  Updated summary for "${ipDoc.titel?.slice(0, 50)}"`)
+        } else {
           await pool.query(
             `INSERT INTO debates (id, dok_id, dok_type, title, topic, topic_emoji, date, venue, participants, ingress, left_bloc, right_bloc, status)
              VALUES ($1,$2,'ip',$3,'Interpellationsdebatt','',$4,'Riksdagens kammare',$5,$6,$7,$8,'pending')
              ON CONFLICT (id) DO NOTHING`,
-            [dokId, dokId, ipDoc.titel || `Interpellation ${rm}:${ipNum}`, protDate,
+            [dokId, dokId, ipDoc.titel || `Interpellation ${rm}:${ipNummer}`, debateDate,
              JSON.stringify(participants), summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc)]
           )
-          console.log(`saveIPDebates: saved "${ipDoc.titel}" (${protDate})`)
-          await new Promise(r => setTimeout(r, 500))
-        } catch (e) {
-          console.error(`saveIPDebates error for ${rm}:${ipNum}:`, e.message)
+          console.log(`  Saved "${ipDoc.titel?.slice(0, 50)}" (${debateDate})`)
         }
+        await new Promise(r => setTimeout(r, 400))
+      } catch (e) {
+        console.error(`  Error processing ${dokId}:`, e.message)
       }
     }
   }
+  console.log('saveIPDebatesFromProtocols: done')
 }
 
 // ── Vote helpers ──────────────────────────────────────────────────────────────
