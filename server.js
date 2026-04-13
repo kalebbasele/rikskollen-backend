@@ -701,7 +701,7 @@ app.get('/api/public/fragstund', async (req, res) => {
 
 app.get('/admin/debates', requireAdmin, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM debates ORDER BY created_at DESC')
+    const { rows } = await pool.query('SELECT * FROM debates ORDER BY date DESC, created_at DESC')
     res.json(rows)
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
