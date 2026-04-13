@@ -744,18 +744,20 @@ app.post('/admin/force-save-ip', requireAdmin, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY
   if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
   try {
-    // Fetch IP document metadata
-    const ipRes = await fetchWithTimeout(`https://data.riksdagen.se/dokumentlista/?doktyp=ip&dokid=${dokId}&utformat=json&antal=5`, 12000)
-    const ipData = await ipRes.json()
-    const ipDocs = ipData?.dokumentlista?.dokument ?? []
-    const ipArr = Array.isArray(ipDocs) ? ipDocs : [ipDocs]
-    const ipDoc = ipArr.find(d => d.dok_id === dokId) ?? ipArr[0] ?? null
-    if (!ipDoc) return res.status(404).json({ error: 'IP document not found' })
+    // Fetch IP document via dokumentstatus (more complete data than dokumentlista)
+    const statusRes = await fetchWithTimeout(`https://data.riksdagen.se/dokumentstatus/${dokId}.json`, 12000)
+    const statusData = await statusRes.json()
+    const ipDoc = statusData?.dokumentstatus?.dokument
+    if (!ipDoc || !ipDoc.dok_id) return res.status(404).json({ error: 'IP document not found' })
 
-    const debateDate = ipDoc.debattdag || ''
-    if (!debateDate) return res.status(400).json({ error: 'No debattdag on IP document' })
+    // Get debate date from dokaktivitet BESV (Besvarad) entry
+    const aktiviteter = statusData?.dokumentstatus?.dokaktivitet?.aktivitet ?? []
+    const aktivArr = Array.isArray(aktiviteter) ? aktiviteter : [aktiviteter]
+    const besvEntry = aktivArr.find(a => a.kod === 'BESV' && a.status === 'inträffat')
+    const debateDate = (besvEntry?.datum || '').slice(0, 10)
+    if (!debateDate) return res.status(400).json({ error: 'No debate date found in dokaktivitet' })
 
-    const participants = buildParticipantsFromIntressenter(ipDoc.dokintressent)
+    const participants = buildParticipantsFromIntressenter(statusData?.dokumentstatus?.dokintressent)
     if (!participants.length) return res.status(400).json({ error: 'No participants found' })
 
     summaryCache.delete(dokId)
