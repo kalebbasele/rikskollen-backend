@@ -292,8 +292,7 @@ async function generateAndCache(dokId, title, date, apiKey, debateText = '') {
 // New main pipeline: fetch IP documents → group by debattdag → fetch each protocol once
 async function saveIPDebatesFromProtocols(apiKey) {
   const rm = '2025/26'
-  const cutoff = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10)
-  console.log(`saveIPDebatesFromProtocols: fetching IPs for rm=${rm} since ${cutoff}`)
+  console.log(`saveIPDebatesFromProtocols: fetching 30 most recent IPs for rm=${rm}`)
 
   // 0. Pre-build a map of date → protocol dok_id for the entire riksmöte (paginate all ~6 pages)
   const protDateMap = new Map()
@@ -312,34 +311,32 @@ async function saveIPDebatesFromProtocols(apiKey) {
   }
   console.log(`saveIPDebatesFromProtocols: ${protDateMap.size} protocols in date map`)
 
-  // 1. Paginate through all IP documents for this riksmöte
+  // 1. Fetch the most recent 30 IP documents (sorted by debattdag desc)
   const allIPDocs = []
-  for (let page = 1; page <= 30; page++) {
+  const limit = 30
+  for (let page = 1; page <= 5 && allIPDocs.length < limit; page++) {
     try {
       const res = await fetchWithTimeout(
-        `https://data.riksdagen.se/dokumentlista/?doktyp=ip&rm=${encodeURIComponent(rm)}&utformat=json&antal=200&sort=debattdag&sortorder=desc&p=${page}`,
+        `https://data.riksdagen.se/dokumentlista/?doktyp=ip&rm=${encodeURIComponent(rm)}&utformat=json&antal=20&sort=debattdag&sortorder=desc&p=${page}`,
         12000
       )
       const data = await res.json()
       const docs = data?.dokumentlista?.dokument ?? []
       const arr = Array.isArray(docs) ? docs : [docs]
       if (!arr.length || !arr[0]?.dok_id) break
-      // Only keep ones with debattdag within the last 90 days
-      const recent = arr.filter(d => d.debattdag && d.debattdag >= cutoff)
-      allIPDocs.push(...recent)
-      // If the earliest on this page is older than cutoff, stop
-      const earliest = arr[arr.length - 1]?.debattdag ?? ''
-      if (earliest && earliest < cutoff) break
+      const withDate = arr.filter(d => d.debattdag)
+      allIPDocs.push(...withDate)
     } catch (e) {
       console.error(`IP list page ${page} failed:`, e.message)
       break
     }
   }
-  console.log(`saveIPDebatesFromProtocols: ${allIPDocs.length} recent IP docs found`)
+  const recentDocs = allIPDocs.slice(0, limit)
+  console.log(`saveIPDebatesFromProtocols: using ${recentDocs.length} most recent IP docs`)
 
   // 2. Group IPs by debattdag
   const byDate = new Map()
-  for (const doc of allIPDocs) {
+  for (const doc of recentDocs) {
     const date = doc.debattdag
     if (!byDate.has(date)) byDate.set(date, [])
     byDate.get(date).push(doc)
