@@ -738,7 +738,7 @@ app.post('/admin/fix-vote-dokids', requireAdmin, async (req, res) => {
 })
 
 // Force-save a specific IP debate by dok_id (for debates missed by pipeline)
-app.post('/admin/force-save-ip', requireAdmin, async (req, res) => {
+app.post('/admin/debates/force-save', requireAdmin, async (req, res) => {
   const { dokId } = req.body
   if (!dokId) return res.status(400).json({ error: 'dokId required' })
   const apiKey = process.env.ANTHROPIC_API_KEY
