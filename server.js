@@ -126,33 +126,92 @@ function fetchWithTimeout(url, ms = 6000) {
   return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(id))
 }
 
-// ── Riksdagen speech fetchers ─────────────────────────────────────────────────
+// ── Protocol-based IP debate pipeline ────────────────────────────────────────
 
 const summaryCache = new Map()
 
-async function fetchAnforanden(url) {
-  try {
-    const res = await fetch(url)
-    const data = await res.json()
-    const list = data?.anforandelista?.anforande ?? []
-    const arr = Array.isArray(list) ? list : [list]
-    return arr.map(a => `[${a.talare} (${a.parti})]: ${stripTags(a.anforandetext)}`).join('\n\n')
-  } catch { return '' }
+// Find all "Svar på interpellation" debate sections in a stripped protocol text.
+// Distinguishes actual debate sections from TOC entries by checking for "Anf." nearby.
+function extractIPSections(protText) {
+  const sections = []
+  const pattern = /Svar på interpellation(?:erna)? ([\d/,: och]+?) om /gi
+  let m
+  while ((m = pattern.exec(protText)) !== null) {
+    // Check if "Anf." appears within 600 chars — TOC entries don't have speeches directly after
+    const after = protText.slice(m.index, m.index + 600)
+    if (!/Anf\./i.test(after)) continue
+
+    // Extract IP numbers (e.g. "2025/26:356" → "356", or just "356")
+    const ipNumbers = (m[1].match(/\d+/g) || [])
+      .map(Number).filter(n => n >= 100 && n < 10000).map(String)
+    if (!ipNumbers.length) continue
+
+    // Include context before the heading (speaker labels appear before section header)
+    const start = Math.max(0, m.index - 2000)
+    const sectionText = protText.slice(start, m.index + 20000)
+    sections.push({ ipNumbers, sectionText })
+  }
+  return sections
 }
 
-// Hämtar anföranden direkt från dokumentets inbäddade debatt-data.
-// Detta är den mest tillförlitliga källan — garanterat kopplad till rätt debatt.
-async function fetchAnforandenFromDokument(dokId) {
+// Fetch IP document metadata from Riksdag API by nummer + riksmöte
+async function fetchIPDocFromAPI(rm, nummer) {
   try {
-    const res = await fetch(`https://data.riksdagen.se/dokument/${dokId}?utformat=json`)
+    const res = await fetchWithTimeout(
+      `https://data.riksdagen.se/dokumentlista/?doktyp=ip&nummer=${nummer}&rm=${encodeURIComponent(rm)}&utformat=json&antal=5`,
+      10000
+    )
+    const data = await res.json()
+    const docs = data?.dokumentlista?.dokument ?? []
+    const arr = Array.isArray(docs) ? docs : [docs]
+    return arr.find(d => String(d.nummer) === String(nummer)) ?? arr[0] ?? null
+  } catch { return null }
+}
+
+// Build participants list from IP document's dokintressent
+function buildParticipantsFromIntressenter(dokintressent) {
+  const intressenter = dokintressent?.intressent ?? []
+  const arr = Array.isArray(intressenter) ? intressenter : [intressenter]
+  const seen = new Set()
+  const participants = []
+  // Prioritize undertecknare (questioner) and besvaradav (minister answering)
+  const priority = ['undertecknare', 'besvaradav']
+  const sorted = [
+    ...priority.map(role => arr.find(i => i.roll === role)).filter(Boolean),
+    ...arr.filter(i => !priority.includes(i.roll))
+  ]
+  for (const i of sorted) {
+    const id = i.intressent_id || ''
+    if (seen.has(id)) continue
+    seen.add(id)
+    const name = cleanName(i.namn || '')
+    participants.push({
+      role: i.roll || 'talare',
+      person: {
+        id,
+        name,
+        firstName: name.split(' ')[0] || '',
+        lastName: name.split(' ').slice(1).join(' ') || '',
+        party: i.partibet || '',
+        photoUrl: personPhotoUrl(id)
+      }
+    })
+  }
+  return participants
+}
+
+// Fetch speech text for a frågestund from embedded anföranden (reliable — uses dokid not rel_dok_id)
+async function fetchFragstundText(dokId) {
+  try {
+    const res = await fetchWithTimeout(`https://data.riksdagen.se/dokument/${dokId}?utformat=json`, 10000)
     const data = await res.json()
     const anforanden = data?.dokumentstatus?.dokument?.debatt?.anforande ?? []
     const arr = Array.isArray(anforanden) ? anforanden : [anforanden]
-    if (arr.length === 0) return ''
+    if (!arr.length) return ''
     const results = await Promise.allSettled(
-      arr.slice(0, 8).map(async a => {
+      arr.slice(0, 12).map(async a => {
         if (!a.anforande_url_html) return ''
-        const r = await fetch(a.anforande_url_html)
+        const r = await fetchWithTimeout(a.anforande_url_html, 8000)
         const html = await r.text()
         const text = stripTags(html).trim()
         return text.length > 50 ? `[${a.talare} (${a.parti})]: ${text.slice(0, 1500)}` : ''
@@ -162,195 +221,56 @@ async function fetchAnforandenFromDokument(dokId) {
   } catch { return '' }
 }
 
-async function fetchAnforandenByHtml(dokId) {
+// Find the protocol section for a specific IP debate (used by reset-summary)
+async function fetchIPSectionForDebate(dokId, date, title) {
   try {
-    const [r1, r2] = await Promise.all([
-      fetch(`https://data.riksdagen.se/anforandelista/?rel_dok_id=${dokId}&utformat=json&antal=50`).then(r => r.json()).catch(() => ({})),
-      fetch(`https://data.riksdagen.se/anforandelista/?dokid=${dokId}&utformat=json&antal=50`).then(r => r.json()).catch(() => ({})),
-    ])
-    const merge = new Map()
-    for (const d of [r1, r2]) {
-      const list = d?.anforandelista?.anforande ?? []
-      const arr = Array.isArray(list) ? list : [list]
-      for (const a of arr) { if (a.anforande_url_html) merge.set(a.anforande_url_html, a) }
-    }
-    const uniq = [...merge.values()]
-    if (uniq.length === 0) return ''
-    const results = await Promise.allSettled(
-      uniq.slice(0, 8).map(async a => {
-        const r = await fetch(a.anforande_url_html)
-        const html = await r.text()
-        const text = stripTags(html).trim()
-        return text.length > 50 ? `[${a.talare} (${a.parti})]: ${text.slice(0, 1500)}` : ''
-      })
+    const dateStr = (date || '').replace(/-/g, '')
+    if (!dateStr) return ''
+    // Extract IP nummer from dok_id (e.g. HD10356 → 356, HD01KU31 → no match → '')
+    const nummerMatch = dokId.match(/^[A-Z]+\d{2}(\d+)$/i)
+    const ipNummer = nummerMatch?.[1] ?? ''
+
+    const protRes = await fetchWithTimeout(
+      `https://data.riksdagen.se/dokumentlista/?doktyp=prot&from=${dateStr}&tom=${dateStr}&utformat=json&antal=5`,
+      10000
     )
-    return results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value).join('\n\n')
-  } catch { return '' }
-}
-
-// Hittar rätt debattsektion i protokollet.
-// Pass 1: letar efter förekomst följd av "föredrogs" inom 300 tecken (exakt debattstart).
-// Pass 2: fallback — väljer förekomst med längst genomsnittliga ord (löptext vs TOC).
-function findBestSectionInProtocol(clean, searchTerms) {
-  for (const term of searchTerms) {
-    if (!term) continue
-    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const pattern = new RegExp(escaped, 'i')
-    let searchFrom = 0
-    let m
-
-    // Pass 1: "föredrogs" nearby = actual debate section
-    while ((m = clean.slice(searchFrom).search(pattern)) >= 0) {
-      const absoluteIdx = searchFrom + m
-      if (/f\u00f6redrogs/i.test(clean.slice(absoluteIdx, absoluteIdx + 300))) {
-        const section = clean.slice(absoluteIdx, absoluteIdx + 20000)
-        if (section.length >= 200) return section
-      }
-      searchFrom = absoluteIdx + 1
-      if (searchFrom >= clean.length) break
-    }
-
-    // Pass 2: pick occurrence with highest avg word length (actual text > TOC entries)
-    let bestIdx = -1, bestScore = -1
-    searchFrom = 0
-    while ((m = clean.slice(searchFrom).search(pattern)) >= 0) {
-      const absoluteIdx = searchFrom + m
-      const words = clean.slice(absoluteIdx, absoluteIdx + 3000).split(/\s+/).filter(w => w.length > 0)
-      const avgLen = words.reduce((s, w) => s + w.length, 0) / (words.length || 1)
-      if (avgLen > bestScore) { bestScore = avgLen; bestIdx = absoluteIdx }
-      searchFrom = absoluteIdx + 1
-      if (searchFrom >= clean.length) break
-    }
-    if (bestIdx >= 0) {
-      const section = clean.slice(Math.max(0, bestIdx - 2000), bestIdx + 20000)
-      if (section.length >= 200) return section
-    }
-  }
-  return ''
-}
-
-async function fetchProtocolSection(date, title, dokId = '') {
-  try {
-    const dateStr = date.replace(/-/g, '')
-    const protRes = await fetch(`https://data.riksdagen.se/dokumentlista/?doktyp=prot&from=${dateStr}&tom=${dateStr}&utformat=json&antal=20`)
     const protData = await protRes.json()
-    const protDocs = protData?.dokumentlista?.dokument ?? []
-    const protArr = Array.isArray(protDocs) ? protDocs : [protDocs]
-    const matching = protArr.filter(p => p.datum === date)
-    const candidates = matching.length > 0 ? matching : protArr.slice(0, 1)
+    const prots = protData?.dokumentlista?.dokument ?? []
+    const protArr = Array.isArray(prots) ? prots : [prots]
 
-    // Build search terms: beteckning first (most precise), then title words
-    const beteckning = dokId ? dokId.replace(/^HD\d+/i, '') : ''  // e.g. 'HD01SoU19' → 'SoU19'
-    const titleWords = (title || '').split(' ').filter(w => w.length > 4)
-    const searchTerms = [beteckning, ...titleWords].filter(Boolean)
+    for (const prot of protArr.filter(p => p?.dok_id)) {
+      const textRes = await fetchWithTimeout(`https://data.riksdagen.se/dokument/${prot.dok_id}.text`, 15000)
+      const raw = await textRes.text()
+      const protText = stripTags(raw)
+      const sections = extractIPSections(protText)
 
-    for (const prot of candidates) {
-      const res = await fetch(`https://data.riksdagen.se/dokument/${prot.dok_id}.text`)
-      const raw = await res.text()
-      const clean = stripTags(raw)
-      const section = findBestSectionInProtocol(clean, searchTerms)
-      if (section) return section
+      // First try: match by IP nummer (most reliable)
+      if (ipNummer) {
+        const byNum = sections.find(s => s.ipNumbers.includes(ipNummer))
+        if (byNum) return byNum.sectionText
+      }
+      // Fallback: match by title keywords
+      const titleWords = title.toLowerCase().split(/\s+/).filter(w => w.length > 4)
+      const byTitle = sections.find(s => titleWords.some(w => s.sectionText.toLowerCase().includes(w)))
+      if (byTitle) return byTitle.sectionText
     }
-  } catch {}
+  } catch (e) { console.error('fetchIPSectionForDebate error:', e.message) }
   return ''
 }
 
-// Hämtar alla anföranden från protokollet för debattdagen och filtrerar på titelnyckelord.
-// Mer tillförlitlig än fetchAnforandenByTitle som söker brett över 6 månader.
-async function fetchAnforandenFromProtocol(date, title) {
-  try {
-    const dateStr = date.replace(/-/g, '')
-    const res = await fetch(`https://data.riksdagen.se/anforandelista/?utformat=json&antal=200&from=${dateStr}&tom=${dateStr}`)
-    const data = await res.json()
-    const list = data?.anforandelista?.anforande ?? []
-    const arr = Array.isArray(list) ? list : [list]
-    const words = (title || '').split(/\s+/).filter(w => w.length > 4)
-    const relevant = arr.filter(a => {
-      const rubrik = ((a.avsnittsrubrik || '') + ' ' + (a.kammaraktivitet || '')).toLowerCase()
-      return words.some(w => rubrik.includes(w.toLowerCase()))
-    })
-    if (relevant.length === 0) return ''
-    console.log(`fetchAnforandenFromProtocol: ${relevant.length} träffar för "${title}" (${date})`)
-    const results = await Promise.allSettled(
-      relevant.slice(0, 10).map(async a => {
-        if (!a.anforande_url_html) return ''
-        const r = await fetch(a.anforande_url_html)
-        const html = await r.text()
-        const text = stripTags(html).trim()
-        return text.length > 50 ? `[${a.talare} (${a.parti})]: ${text.slice(0, 1500)}` : ''
-      })
-    )
-    return results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value).join('\n\n')
-  } catch(e) { console.error('fetchAnforandenFromProtocol error:', e.message); return '' }
-}
-
-async function fetchDebateText(dokId, date, title, kammaraktivitet = '') {
-  try {
-    // Strategy 0: fetch speeches directly from the document's embedded debate data.
-    // This is the only source guaranteed to be linked to exactly this debate.
-    const fromDok = await fetchAnforandenFromDokument(dokId)
-    if (fromDok && fromDok.length >= 200) {
-      console.log(`fetchDebateText: got ${fromDok.length} chars from dokument/${dokId}`)
-      return fromDok.slice(0, 18000)
-    }
-
-    const results = await Promise.allSettled([
-      fetchAnforanden(`https://data.riksdagen.se/anforandelista/?rel_dok_id=${dokId}&utformat=json&antal=20`),
-      fetchAnforanden(`https://data.riksdagen.se/anforandelista/?dokid=${dokId}&utformat=json&antal=20`),
-      fetchAnforandenByHtml(dokId),
-      date ? fetchProtocolSection(date, title, dokId) : Promise.resolve(''),
-      date ? fetchAnforandenFromProtocol(date, title) : Promise.resolve(''),
-    ])
-    const texts = results.map(r => r.status === 'fulfilled' ? r.value : '')
-
-    // The most distinctive word from the title (longest, >5 chars).
-    // Every candidate text MUST contain this word — otherwise it's from the wrong debate.
-    const titleWords = (title || '').split(/\s+/).filter(w => w.length > 5)
-    const distinctWord = titleWords.sort((a, b) => b.length - a.length)[0] ?? ''
-
-    function containsDistinctWord(t) {
-      if (!distinctWord) return true
-      return t.toLowerCase().includes(distinctWord.toLowerCase())
-    }
-
-    // Detect debates where no speakers registered
-    const protocolText = texts[3]
-    if (protocolText && /ingen talare var anm/i.test(protocolText)) {
-      return '__NO_SPEAKERS__'
-    }
-
-    // Protocol section preferred — but only if the distinct title word is actually in it.
-    // This prevents the TOC-grab bug where 20 000 chars after a TOC entry contains wrong debate.
-    if (protocolText && protocolText.length >= 300 && containsDistinctWord(protocolText)) {
-      return protocolText.slice(0, 18000)
-    }
-
-    // Remaining strategies: must contain the distinct title word
-    const relevant = texts.filter((t, i) => {
-      if (i === 3) return false
-      if (t.length < 200) return false
-      return containsDistinctWord(t)
-    })
-    const best = relevant.sort((a, b) => b.length - a.length)[0]
-    if (best) return best.slice(0, 18000)
-  } catch {}
-  return ''
-}
-
-async function generateAndCache(dokId, title, date, apiKey, dokType = 'ip') {
+// Generate and cache AI summary — accepts pre-loaded debate text
+async function generateAndCache(dokId, title, date, apiKey, debateText = '') {
   if (summaryCache.has(dokId)) return summaryCache.get(dokId)
-  const kammaraktivitet = dokType === 'bet' ? 'betankandedebatt' : 'interpellationsdebatt'
-  const protocol = await fetchDebateText(dokId, date, title, kammaraktivitet)
+  if (!debateText || debateText.length < 100) return null
+  if (/ingen talare var anm/i.test(debateText)) return null
 
-  // No speakers registered — this debate has no content to summarize, exclude it entirely
-  if (protocol === '__NO_SPEAKERS__' || !protocol || protocol.length < 100) return null
   const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 900,
-      messages: [{ role: 'user', content: `Du är politisk reporter på Omni. Skriv om riksdagsdebatten nedan på korrekt, naturlig svenska.\n\nBLOCKTILLHÖRIGHET – strikt:\n- Vänsterblocket: S, V, MP — dessa partier hamnar ALLTID i vansterblocket\n- Högerblocket: M, SD, KD, L, C — dessa partier hamnar ALLTID i hogerblocket\n- Om ett block inte deltog: {"parties":[],"summary":"Inget parti från detta block deltog.","keyArg":""}\n\nMENINGSSTRUKTUR – kritiskt:\n- Max 15 ord per mening. En tanke per mening. Klipp, kombinera inte.\n- Upprepa ALDRIG samma preposition i en lista: inte "pekar på X, på Y, på Z" – skriv istället två separata meningar\n- Inga långa bisatser: inte "Han argumenterar för att utan X och Y och Z blir..."\n- Aktiv form: "SD kräver" inte "ett krav ställs av SD"\n- Inga nominaliseringar: "genomföra" inte "genomförandet av"\n\nGRAMMATIK – kontrollera:\n- Perfekt particip: "tvingat" inte "tvingt", "tagit" inte "tagt"\n- Subjekt-predikat-objekt i rätt ordning\n- Undvik "som"-kedjor längre än ett led\n\nFÖRBJUDET:\n- "lyfte fram", "påpekade att", "menade att", "argumenterar för att"\n- "Med anledning av", "Till följd av", "Vad gäller"\n- "högerblocket", "vänsterblocket", "oppositionen", "regeringen" – använd alltid partiförkortningar (S, M, SD, KD, L, C, V, MP)\n- "Debatten handlade om", "I debatten", "Riksdagen diskuterade"\n\nÖVRIGT:\n- Börja med en person, ett parti eller ett konkret faktum\n- Specifikt för just denna debatt – aldrig generiskt\n- Basera ENBART på texten nedan\n- Om texten uppenbart handlar om ett annat ämne än titeln: svara null\n\nTitel: ${title}\n\n${protocol}\n\nSvara ENDAST med JSON (eller null):\n{"ingress":"2-3 korta meningar. Det skarpaste från debatten – ett krav, en konflikt eller ett oväntat svar.","vansterblocket":{"parties":["partiförkortningar ur S/V/MP"],"summary":"2-3 korta meningar. En tanke per mening.","keyArg":"2-3 meningar som sammanfattar hela deras ståndpunkt – vad de vill, varför, och vad konsekvensen blir om de inte får igenom det. Läsaren ska förstå hela deras position utan att ha läst resten."},"hogerblocket":{"parties":["partiförkortningar ur M/SD/KD/L/C"],"summary":"2-3 korta meningar. En tanke per mening.","keyArg":"2-3 meningar som sammanfattar hela deras ståndpunkt – vad de vill, varför, och vad konsekvensen blir om de inte får igenom det. Läsaren ska förstå hela deras position utan att ha läst resten."}}` }]
+      messages: [{ role: 'user', content: `Du är politisk reporter på Omni. Skriv om riksdagsdebatten nedan på korrekt, naturlig svenska.\n\nBLOCKTILLHÖRIGHET – strikt:\n- Vänsterblocket: S, V, MP — dessa partier hamnar ALLTID i vansterblocket\n- Högerblocket: M, SD, KD, L, C — dessa partier hamnar ALLTID i hogerblocket\n- Om ett block inte deltog: {"parties":[],"summary":"Inget parti från detta block deltog.","keyArg":""}\n\nMENINGSSTRUKTUR – kritiskt:\n- Max 15 ord per mening. En tanke per mening. Klipp, kombinera inte.\n- Upprepa ALDRIG samma preposition i en lista: inte "pekar på X, på Y, på Z" – skriv istället två separata meningar\n- Inga långa bisatser: inte "Han argumenterar för att utan X och Y och Z blir..."\n- Aktiv form: "SD kräver" inte "ett krav ställs av SD"\n- Inga nominaliseringar: "genomföra" inte "genomförandet av"\n\nGRAMMATIK – kontrollera:\n- Perfekt particip: "tvingat" inte "tvingt", "tagit" inte "tagt"\n- Subjekt-predikat-objekt i rätt ordning\n- Undvik "som"-kedjor längre än ett led\n\nFÖRBJUDET:\n- "lyfte fram", "påpekade att", "menade att", "argumenterar för att"\n- "Med anledning av", "Till följd av", "Vad gäller"\n- "högerblocket", "vänsterblocket", "oppositionen", "regeringen" – använd alltid partiförkortningar (S, M, SD, KD, L, C, V, MP)\n- "Debatten handlade om", "I debatten", "Riksdagen diskuterade"\n\nÖVRIGT:\n- Börja med en person, ett parti eller ett konkret faktum\n- Specifikt för just denna debatt – aldrig generiskt\n- Basera ENBART på texten nedan\n- Om texten uppenbart handlar om ett annat ämne än titeln: svara null\n\nTitel: ${title}\n\n${debateText.slice(0, 18000)}\n\nSvara ENDAST med JSON (eller null):\n{"ingress":"2-3 korta meningar. Det skarpaste från debatten – ett krav, en konflikt eller ett oväntat svar.","vansterblocket":{"parties":["partiförkortningar ur S/V/MP"],"summary":"2-3 korta meningar. En tanke per mening.","keyArg":"2-3 meningar som sammanfattar hela deras ståndpunkt – vad de vill, varför, och vad konsekvensen blir om de inte får igenom det. Läsaren ska förstå hela deras position utan att ha läst resten."},"hogerblocket":{"parties":["partiförkortningar ur M/SD/KD/L/C"],"summary":"2-3 korta meningar. En tanke per mening.","keyArg":"2-3 meningar som sammanfattar hela deras ståndpunkt – vad de vill, varför, och vad konsekvensen blir om de inte får igenom det. Läsaren ska förstå hela deras position utan att ha läst resten."}}` }]
     })
   })
   const aiData = await aiRes.json()
@@ -359,6 +279,97 @@ async function generateAndCache(dokId, title, date, apiKey, dokType = 'ip') {
   const result = JSON.parse(text)
   summaryCache.set(dokId, result)
   return result
+}
+
+// New main pipeline: scan protocols for IP debates and save to DB
+async function saveIPDebatesFromProtocols(apiKey) {
+  const tom = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+  const from90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10).replace(/-/g, '')
+
+  const protRes = await fetchWithTimeout(
+    `https://data.riksdagen.se/dokumentlista/?doktyp=prot&from=${from90}&tom=${tom}&utformat=json&antal=100`,
+    15000
+  )
+  const protData = await protRes.json()
+  const rawProts = protData?.dokumentlista?.dokument ?? []
+  const protArr = (Array.isArray(rawProts) ? rawProts : [rawProts]).filter(p => p?.dok_id)
+  console.log(`saveIPDebatesFromProtocols: found ${protArr.length} protocols`)
+
+  for (const prot of protArr) {
+    const protDate = (prot.datum || '').slice(0, 10)
+    const rm = prot.rm || '2025/26'
+
+    let protText = ''
+    try {
+      const textRes = await fetchWithTimeout(`https://data.riksdagen.se/dokument/${prot.dok_id}.text`, 15000)
+      const raw = await textRes.text()
+      protText = stripTags(raw)
+    } catch (e) {
+      console.error(`Protocol text fetch failed ${prot.dok_id}:`, e.message)
+      continue
+    }
+
+    const sections = extractIPSections(protText)
+    if (!sections.length) continue
+    console.log(`Protocol ${prot.dok_id} (${protDate}): ${sections.length} IP sections`)
+
+    for (const section of sections) {
+      for (const ipNum of section.ipNumbers) {
+        try {
+          const ipDoc = await fetchIPDocFromAPI(rm, ipNum)
+          if (!ipDoc) { console.log(`No IP doc found for ${rm}:${ipNum}`); continue }
+          const dokId = ipDoc.dok_id
+          if (!dokId) continue
+
+          const existing = await pool.query('SELECT id, ingress FROM debates WHERE dok_id = $1', [dokId])
+          if (existing.rows.length > 0) {
+            // Already saved — retry AI only if ingress is still missing
+            if (existing.rows[0].ingress) continue
+            summaryCache.delete(dokId)
+            const summary = await generateAndCache(dokId, ipDoc.titel || '', protDate, apiKey, section.sectionText)
+            if (summary) {
+              const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+              const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+              await pool.query(
+                'UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE dok_id = $4',
+                [summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), dokId]
+              )
+              console.log(`saveIPDebates: filled missing summary for "${ipDoc.titel}"`)
+            } else {
+              await pool.query('DELETE FROM debates WHERE dok_id = $1', [dokId])
+              console.log(`saveIPDebates: deleted "${ipDoc.titel}" — no content`)
+            }
+            continue
+          }
+
+          const participants = buildParticipantsFromIntressenter(ipDoc.dokintressent)
+          if (!participants.length) { console.log(`No participants for ${dokId}`); continue }
+
+          summaryCache.delete(dokId)
+          const summary = await generateAndCache(dokId, ipDoc.titel || '', protDate, apiKey, section.sectionText)
+          if (!summary) {
+            console.log(`saveIPDebates: skipping ${dokId} — no content`)
+            continue
+          }
+
+          const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+          const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+
+          await pool.query(
+            `INSERT INTO debates (id, dok_id, dok_type, title, topic, topic_emoji, date, venue, participants, ingress, left_bloc, right_bloc, status)
+             VALUES ($1,$2,'ip',$3,'Interpellationsdebatt','',$4,'Riksdagens kammare',$5,$6,$7,$8,'pending')
+             ON CONFLICT (id) DO NOTHING`,
+            [dokId, dokId, ipDoc.titel || `Interpellation ${rm}:${ipNum}`, protDate,
+             JSON.stringify(participants), summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc)]
+          )
+          console.log(`saveIPDebates: saved "${ipDoc.titel}" (${protDate})`)
+          await new Promise(r => setTimeout(r, 500))
+        } catch (e) {
+          console.error(`saveIPDebates error for ${rm}:${ipNum}:`, e.message)
+        }
+      }
+    }
+  }
 }
 
 // ── Vote helpers ──────────────────────────────────────────────────────────────
@@ -423,120 +434,7 @@ Svara ENDAST med JSON:
   return JSON.parse(text.replace(/```json|```/g, '').trim())
 }
 
-// ── Riksdagen debate parser ───────────────────────────────────────────────────
-
-function parseParticipants(dok) {
-  const intressenter = (() => { const i = dok.dokintressent?.intressent; if (!i) return []; return Array.isArray(i) ? i : [i] })()
-  const anforanden = (() => { const a = dok.debatt?.anforande; if (!a) return []; return Array.isArray(a) ? a : [a] })()
-
-  const anforMap = new Map()
-  for (const a of anforanden) {
-    if (a.intressent_id && !anforMap.has(a.intressent_id)) {
-      anforMap.set(a.intressent_id, { name: cleanName(a.talare ?? ''), party: a.parti || a.partibet || '' })
-    }
-  }
-
-  const makeParticipant = (i, role) => {
-    const id = i.intressent_id ?? ''
-    const fromAnf = anforMap.get(id)
-    const name = fromAnf?.name || cleanName(i.namn ?? 'Okänd')
-    const party = i.partibet || i.parti || fromAnf?.party || ''
-    return { person: { id, name, firstName: name.split(' ')[0], lastName: name.split(' ').slice(1).join(' '), party, photoUrl: personPhotoUrl(id) }, role }
-  }
-
-  const seen = new Set()
-  const participants = []
-
-  const undertecknare = intressenter.find(i => i.roll === 'undertecknare')
-  if (undertecknare?.intressent_id) { seen.add(undertecknare.intressent_id); participants.push(makeParticipant(undertecknare, 'undertecknare')) }
-
-  const besvaradav = intressenter.find(i => i.roll === 'besvaradav')
-  if (besvaradav?.intressent_id && !seen.has(besvaradav.intressent_id)) { seen.add(besvaradav.intressent_id); participants.push(makeParticipant(besvaradav, 'besvaradav')) }
-
-  for (const a of anforanden) {
-    const id = a.intressent_id
-    if (!id || seen.has(id)) continue
-    seen.add(id)
-    const fromDok = intressenter.find(i => i.intressent_id === id)
-    if (fromDok) {
-      participants.push(makeParticipant(fromDok, 'talare'))
-    } else {
-      const name = cleanName(a.talare ?? 'Okänd')
-      participants.push({ person: { id, name, firstName: name.split(' ')[0], lastName: name.split(' ').slice(1).join(' '), party: a.parti || a.partibet || '', photoUrl: personPhotoUrl(id) }, role: 'talare' })
-    }
-  }
-
-  const seenNames = new Set()
-  return participants.filter(p => {
-    const key = p.person.name.toLowerCase().trim()
-    if (seenNames.has(key)) return false
-    seenNames.add(key)
-    return true
-  })
-}
-
-async function fetchDebatesFromRiksdagen() {
-  const res = await fetch('https://data.riksdagen.se/dokumentlista/?doktyp=ip&utformat=json&antal=30&sort=debattdag&sortorder=desc')
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const data = await res.json()
-  const rawDok = data?.dokumentlista?.dokument ?? []
-  const dokument = Array.isArray(rawDok) ? rawDok : [rawDok]
-  const debates = []
-
-  for (const dok of dokument) {
-    if (debates.length >= 20) break
-    if (!dok.debatt) continue
-    const participants = parseParticipants(dok)
-    if (participants.length === 0) continue
-    const anforanden = (() => { const a = dok.debatt?.anforande; if (!a) return []; return Array.isArray(a) ? a : [a] })()
-    const debattdag = dok.debattdag || anforanden[0]?.anf_datumtid?.slice(0, 10) || dok.datum || ''
-    debates.push({
-      id: dok.dok_id,
-      dokId: dok.dok_id,
-      dokType: 'ip',
-      title: dok.titel ?? 'Debatt',
-      topic: dok.debattnamn ?? 'Interpellationsdebatt',
-      topicEmoji: '',
-      date: debattdag,
-      venue: 'Riksdagens kammare',
-      participants,
-    })
-  }
-  return debates.sort((a, b) => b.date > a.date ? 1 : -1)
-}
-
-async function fetchBetankandeDebates() {
-  const res = await fetch('https://data.riksdagen.se/dokumentlista/?doktyp=bet&utformat=json&antal=50&sort=datum&sortorder=desc')
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const data = await res.json()
-  const rawDok = data?.dokumentlista?.dokument ?? []
-  const dokument = Array.isArray(rawDok) ? rawDok : [rawDok]
-  const debates = []
-
-  for (const dok of dokument) {
-    if (debates.length >= 20) break
-    // Only include if there's an actual protocol with speeches
-    const anforanden = (() => { const a = dok.debatt?.anforande; if (!a) return []; return Array.isArray(a) ? a : [a] })()
-    if (anforanden.length === 0) continue
-    const participants = parseParticipants(dok)
-    if (participants.length === 0) continue
-    const debattdag = dok.debattdag || anforanden[0]?.anf_datumtid?.slice(0, 10) || dok.datum || ''
-    // Use committee/organ as topic
-    const topic = dok.organ ? `Utskottsdebatt · ${dok.organ.toUpperCase()}` : (dok.debattnamn ?? 'Debatt om förslag')
-    debates.push({
-      id: dok.dok_id,
-      dokId: dok.dok_id,
-      dokType: 'bet',
-      title: dok.titel ?? dok.notisrubrik ?? 'Betänkandedebatt',
-      topic,
-      topicEmoji: '',
-      date: debattdag,
-      venue: 'Riksdagens kammare',
-      participants,
-    })
-  }
-  return debates.sort((a, b) => b.date > a.date ? 1 : -1)
-}
+// ── Frågestund ────────────────────────────────────────────────────────────────
 
 async function fetchFragstund() {
   const res = await fetch('https://data.riksdagen.se/dokumentlista/?doktyp=kam-fs&utformat=json&antal=50&sort=datum&sortorder=desc')
@@ -547,7 +445,6 @@ async function fetchFragstund() {
   const result = []
 
   for (const dok of dokument) {
-    // Only include frågestund that have a debate protocol with speeches
     const anforanden = (() => { const a = dok.debatt?.anforande; if (!a) return []; return Array.isArray(a) ? a : [a] })()
     if (anforanden.length === 0) continue
     const date = (dok.datum ?? '').slice(0, 10)
@@ -563,7 +460,7 @@ async function fetchFragstund() {
 }
 
 async function generateFragstundSummary(dokId, title, date, apiKey) {
-  const protocol = await fetchDebateText(dokId, date, title, 'fragstund')
+  const protocol = await fetchFragstundText(dokId)
   if (!protocol || protocol.length < 100) return null
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -638,71 +535,9 @@ async function runAutoFetch() {
   if (!apiKey) { console.log('Auto-fetch: no ANTHROPIC_API_KEY, skipping'); return }
   console.log('Auto-fetch: starting...')
 
-  // 1. Debates (interpellationer + betänkandedebatter)
-  async function saveDebates(debates) {
-    for (const debate of debates) {
-      const existing = await pool.query('SELECT id, ingress FROM debates WHERE id = $1', [debate.id])
-
-      if (existing.rows.length > 0) {
-        // Already saved — retry AI only if ingress is still missing
-        if (existing.rows[0].ingress) continue
-        let ingress = null, leftBloc = null, rightBloc = null
-        try {
-          const summary = await generateAndCache(debate.dokId, debate.title, debate.date, apiKey, debate.dokType ?? 'ip')
-          if (summary) {
-            ingress = summary.ingress
-            leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
-            rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
-            await pool.query(
-              'UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE id = $4',
-              [ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), debate.id]
-            )
-            console.log(`Auto-fetch: filled in missing summary for "${debate.title}"`)
-          } else {
-            // Still no content (no speakers / protocol mismatch) — remove the row
-            await pool.query('DELETE FROM debates WHERE id = $1', [existing.rows[0].id])
-            console.log(`Auto-fetch: deleted "${debate.title}" — no debate content`)
-          }
-        } catch(e) { console.error(`AI retry failed ${debate.id}:`, e.message) }
-        continue
-      }
-
-      // New debate — generate summary and insert only if content exists
-      let ingress = null, leftBloc = null, rightBloc = null
-      try {
-        const summary = await generateAndCache(debate.dokId, debate.title, debate.date, apiKey, debate.dokType ?? 'ip')
-        if (summary) {
-          ingress = summary.ingress
-          leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
-          rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
-        } else {
-          // No summary means no speakers / no debate content — skip entirely
-          console.log(`Auto-fetch: skipping "${debate.title}" — no debate content found`)
-          continue
-        }
-      } catch(e) { console.error(`AI debate failed ${debate.id}:`, e.message); continue }
-
-      await pool.query(
-        `INSERT INTO debates (id, dok_id, dok_type, title, topic, topic_emoji, date, venue, participants, ingress, left_bloc, right_bloc, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending') ON CONFLICT (id) DO NOTHING`,
-        [debate.id, debate.dokId, debate.dokType ?? 'ip', debate.title, debate.topic, debate.topicEmoji, debate.date, debate.venue,
-         JSON.stringify(debate.participants), ingress,
-         leftBloc ? JSON.stringify(leftBloc) : null,
-         rightBloc ? JSON.stringify(rightBloc) : null]
-      )
-      console.log(`Auto-fetch: saved debate "${debate.title}" (${debate.dokType ?? 'ip'})`)
-    }
-  }
-
+  // 1. IP Debates — scan protocols for interpellationsdebatter
   try {
-    const [ipDebates, betDebates] = await Promise.allSettled([
-      fetchDebatesFromRiksdagen(),
-      fetchBetankandeDebates(),
-    ])
-    if (ipDebates.status === 'fulfilled') await saveDebates(ipDebates.value)
-    else console.error('Auto-fetch ip debates error:', ipDebates.reason?.message)
-    if (betDebates.status === 'fulfilled') await saveDebates(betDebates.value)
-    else console.error('Auto-fetch bet debates error:', betDebates.reason?.message)
+    await saveIPDebatesFromProtocols(apiKey)
   } catch(e) { console.error('Auto-fetch debates error:', e.message) }
 
   // 2. Votes
@@ -764,7 +599,6 @@ async function runAutoFetch() {
       const existing = await pool.query('SELECT id, summary FROM fragstund WHERE id = $1', [fs.id])
 
       if (existing.rows.length > 0) {
-        // Already saved — retry AI only if summary is still missing
         if (existing.rows[0].summary) continue
         try {
           const summary = await generateFragstundSummary(fs.dokId, fs.title, fs.date, apiKey)
@@ -851,24 +685,24 @@ app.post('/admin/fix-vote-dokids', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
-// Reset a debate's summary so it gets regenerated on the next auto-fetch cycle
+// Reset a debate's summary — fetches protocol section and regenerates
 app.post('/admin/debates/reset-summary', requireAdmin, async (req, res) => {
   const { dokId } = req.body
   if (!dokId) return res.status(400).json({ error: 'dokId required' })
   const apiKey = process.env.ANTHROPIC_API_KEY
   try {
     summaryCache.delete(dokId)
-    const { rows } = await pool.query('SELECT id, dok_id, dok_type, title, date FROM debates WHERE dok_id = $1', [dokId])
+    const { rows } = await pool.query('SELECT id, dok_id, title, date FROM debates WHERE dok_id = $1', [dokId])
     if (rows.length === 0) return res.status(404).json({ error: 'Debate not found' })
     const row = rows[0]
 
     if (!apiKey) {
-      // No API key — just null the ingress so it gets retried later
       await pool.query('UPDATE debates SET ingress = NULL, left_bloc = NULL, right_bloc = NULL WHERE dok_id = $1', [dokId])
       return res.json({ ok: true, action: 'reset' })
     }
 
-    const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, row.dok_type ?? 'ip')
+    const debateText = await fetchIPSectionForDebate(row.dok_id, row.date, row.title)
+    const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, debateText)
     if (summary) {
       const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
       const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
@@ -878,7 +712,6 @@ app.post('/admin/debates/reset-summary', requireAdmin, async (req, res) => {
       )
       res.json({ ok: true, action: 'updated' })
     } else {
-      // No content (no speakers / wrong debate) — delete it
       await pool.query('DELETE FROM debates WHERE id = $1', [row.id])
       console.log(`reset-summary: deleted "${row.title}" — no debate content`)
       res.json({ ok: true, action: 'deleted' })
@@ -993,13 +826,14 @@ app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
   if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
   try {
     const { rows: debateRows } = await pool.query(
-      "SELECT id, dok_id, dok_type, title, date FROM debates WHERE ingress IS NULL ORDER BY date DESC LIMIT 20"
+      "SELECT id, dok_id, title, date FROM debates WHERE ingress IS NULL ORDER BY date DESC LIMIT 20"
     )
     let updatedDebates = 0
     for (const row of debateRows) {
       try {
         summaryCache.delete(row.dok_id)
-        const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, row.dok_type ?? 'ip')
+        const debateText = await fetchIPSectionForDebate(row.dok_id, row.date, row.title)
+        const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, debateText)
         if (summary) {
           const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
           const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
@@ -1009,7 +843,6 @@ app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
           )
           updatedDebates++
         } else {
-          // No content found — delete the row entirely
           await pool.query('DELETE FROM debates WHERE id = $1', [row.id])
           console.log(`regenerate: deleted "${row.title}" — no debate content`)
         }
@@ -1038,7 +871,7 @@ app.post('/admin/regenerate-all-summaries', requireAdmin, async (req, res) => {
   if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
   try {
     const { rows } = await pool.query(
-      "SELECT id, dok_id, dok_type, title, date FROM debates ORDER BY date DESC LIMIT 50"
+      "SELECT id, dok_id, title, date FROM debates ORDER BY date DESC LIMIT 50"
     )
     res.json({ started: true, total: rows.length })
     // Run in background after responding
@@ -1047,7 +880,8 @@ app.post('/admin/regenerate-all-summaries', requireAdmin, async (req, res) => {
       for (const row of rows) {
         try {
           summaryCache.delete(row.dok_id)
-          const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, row.dok_type ?? 'ip')
+          const debateText = await fetchIPSectionForDebate(row.dok_id, row.date, row.title)
+          const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, debateText)
           if (summary) {
             const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
             const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
@@ -1066,23 +900,6 @@ app.post('/admin/regenerate-all-summaries', requireAdmin, async (req, res) => {
       }
       console.log(`regenerate-all: done. ${updated} updated.`)
     })()
-  } catch(e) { res.status(500).json({ error: e.message }) }
-})
-
-app.post('/admin/refetch-bet-debates', requireAdmin, async (req, res) => {
-  try {
-    await pool.query("DELETE FROM debates WHERE dok_type = 'bet'")
-    const debates = await fetchBetankandeDebates()
-    let saved = 0
-    for (const debate of debates) {
-      await pool.query(
-        `INSERT INTO debates (id, dok_id, dok_type, title, topic, topic_emoji, date, venue, participants, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending') ON CONFLICT (id) DO NOTHING`,
-        [debate.id, debate.dokId, 'bet', debate.title, debate.topic, debate.topicEmoji, debate.date, debate.venue, JSON.stringify(debate.participants)]
-      )
-      saved++
-    }
-    res.json({ deleted: true, saved })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
@@ -1127,7 +944,6 @@ app.get('/api/public/reactions/:debateId', async (req, res) => {
       'SELECT bloc, reaction, count FROM reactions WHERE debate_id = $1',
       [req.params.debateId]
     )
-    // Return { left: { up: N, down: N }, right: { up: N, down: N } }
     const result = { left: { up: 0, down: 0 }, right: { up: 0, down: 0 } }
     for (const r of rows) {
       if (result[r.bloc] !== undefined && (r.reaction === 'up' || r.reaction === 'down')) {
@@ -1194,7 +1010,7 @@ app.get('/admin/stats/valkompass', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
-// ── Existing endpoints (kept) ─────────────────────────────────────────────────
+// ── Legacy / proxy endpoints ──────────────────────────────────────────────────
 
 const votesCache = { data: null, ts: 0, building: false }
 const VOTES_TTL = 8 * 60 * 60 * 1000
@@ -1233,7 +1049,8 @@ app.get('/summary/:dokId', async (req, res) => {
   const apiKey = req.headers['x-api-key'] || process.env.ANTHROPIC_API_KEY
   if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
   try {
-    const result = await generateAndCache(req.params.dokId, req.query.title || req.params.dokId, req.query.date || '', apiKey)
+    const debateText = await fetchIPSectionForDebate(req.params.dokId, req.query.date || '', req.query.title || req.params.dokId)
+    const result = await generateAndCache(req.params.dokId, req.query.title || req.params.dokId, req.query.date || '', apiKey, debateText)
     if (!result) return res.status(500).json({ error: 'Could not generate' })
     res.json({ dok_id: req.params.dokId, ...result })
   } catch(e) { res.status(500).json({ error: e.message }) }
