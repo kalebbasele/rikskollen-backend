@@ -859,6 +859,35 @@ app.post('/admin/debates/:id/approve', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+// Reset and regenerate summary for a specific debate (dynamic path to bypass CDN cache)
+app.post('/admin/debates/:id/reset', requireAdmin, async (req, res) => {
+  const dokId = req.params.id
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  try {
+    summaryCache.delete(dokId)
+    const { rows } = await pool.query('SELECT id, dok_id, title, date FROM debates WHERE dok_id = $1', [dokId])
+    if (rows.length === 0) return res.status(404).json({ error: 'Debate not found' })
+    const row = rows[0]
+
+    const debateText = await fetchIPSectionForDebate(row.dok_id, row.date, row.title)
+    if (!debateText) return res.status(404).json({ error: 'No protocol section found' })
+
+    const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, debateText)
+    if (summary) {
+      const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+      const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+      await pool.query(
+        'UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE id = $4',
+        [summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), row.id]
+      )
+      res.json({ ok: true, title: row.title, date: row.date })
+    } else {
+      await pool.query('DELETE FROM debates WHERE id = $1', [row.id])
+      res.json({ ok: true, action: 'deleted', reason: 'no debate content' })
+    }
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 app.post('/admin/votes/:id/approve', requireAdmin, async (req, res) => {
   try {
     await pool.query("UPDATE votes SET status = 'approved', approved_at = NOW() WHERE id = $1", [req.params.id])
