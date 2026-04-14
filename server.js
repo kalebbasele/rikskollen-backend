@@ -133,35 +133,34 @@ const summaryCache = new Map()
 // Find all "Svar på interpellation" debate sections in a stripped protocol text.
 // Distinguishes actual debate sections from TOC entries by checking for "Anf." nearby.
 function extractIPSections(protText) {
-  const sections = []
+  // First pass: collect all actual debate section positions (those with Anf. nearby = real debates, not TOC)
+  const debatePositions = []
   const pattern = /Svar på interpellation(?:erna)? ([\d/,: och]+?) om /gi
   let m
   while ((m = pattern.exec(protText)) !== null) {
-    // Check if "Anf." appears within 600 chars — TOC entries don't have speeches directly after
     const after = protText.slice(m.index, m.index + 600)
     if (!/Anf\./i.test(after)) continue
-
-    // Extract IP numbers from e.g. "2025/26:398, 401 och 406" → ["398", "401", "406"]
-    // Must parse after colon to avoid capturing the year (2025) as a number
     const ipNumbers = []
     const rmPattern = /\d{4}\/\d{2}:(\d+)/g
     let rm2
     while ((rm2 = rmPattern.exec(m[1])) !== null) ipNumbers.push(rm2[1])
-    // Also pick up continuation numbers like ", 401 och 406" in combined debates
     const remaining = m[1].replace(/\d{4}\/\d{2}:\d+/g, '')
     for (const n of (remaining.match(/\d{3,4}/g) || [])) {
       const v = parseInt(n); if (v >= 100 && v < 10000) ipNumbers.push(String(v))
     }
     if (!ipNumbers.length) continue
+    debatePositions.push({ index: m.index, ipNumbers })
+  }
 
-    // Include context before the heading (speaker labels appear before section header)
-    const start = Math.max(0, m.index - 2000)
-    // End at the next "Svar på interpellation" heading to avoid including the next debate
-    const nextMatch = /Svar på interpellation(?:erna)?/gi.exec(protText.slice(m.index + 100))
-    const end = nextMatch
-      ? m.index + 100 + nextMatch.index
-      : m.index + 20000
-    const sectionText = protText.slice(start, Math.min(end, m.index + 20000))
+  // Second pass: build sections with correct end boundaries
+  const sections = []
+  for (let i = 0; i < debatePositions.length; i++) {
+    const { index, ipNumbers } = debatePositions[i]
+    const start = Math.max(0, index - 2000)
+    // End at the start of the next debate section (not TOC entry)
+    const nextDebateStart = i + 1 < debatePositions.length ? debatePositions[i + 1].index : index + 25000
+    const end = Math.min(nextDebateStart, index + 20000)
+    const sectionText = protText.slice(start, end)
     sections.push({ ipNumbers, sectionText })
   }
   return sections
