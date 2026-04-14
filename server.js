@@ -156,7 +156,12 @@ function extractIPSections(protText) {
 
     // Include context before the heading (speaker labels appear before section header)
     const start = Math.max(0, m.index - 2000)
-    const sectionText = protText.slice(start, m.index + 20000)
+    // End at the next "Svar på interpellation" heading to avoid including the next debate
+    const nextMatch = /Svar på interpellation(?:erna)?/gi.exec(protText.slice(m.index + 100))
+    const end = nextMatch
+      ? m.index + 100 + nextMatch.index
+      : m.index + 20000
+    const sectionText = protText.slice(start, Math.min(end, m.index + 20000))
     sections.push({ ipNumbers, sectionText })
   }
   return sections
