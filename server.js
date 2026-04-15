@@ -317,7 +317,7 @@ async function saveIPDebatesFromProtocols(apiKey) {
 
   // 1. Fetch the most recent 30 IP documents (sorted by debattdag desc)
   const allIPDocs = []
-  const limit = 30
+  const limit = 20
   for (let page = 1; page <= 5 && allIPDocs.length < limit; page++) {
     try {
       const res = await fetchWithTimeout(
@@ -892,6 +892,14 @@ app.post('/admin/debates/:id/reset', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+// Unapprove (set back to pending) — dynamic path bypasses CDN cache
+app.post('/admin/debates/:id/unapprove', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("UPDATE debates SET status = 'pending', approved_at = NULL WHERE id = $1", [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 app.post('/admin/votes/:id/approve', requireAdmin, async (req, res) => {
   try {
     await pool.query("UPDATE votes SET status = 'approved', approved_at = NOW() WHERE id = $1", [req.params.id])
@@ -990,16 +998,15 @@ app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
-// Radera alla debatter och kör pipeline från scratch
+// Radera alla pending debatter och kör pipeline från scratch (bevarar approved)
 app.post('/admin/debates/clear-and-refetch', requireAdmin, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY
   if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
   try {
-    const { rowCount } = await pool.query('DELETE FROM debates')
+    const { rowCount } = await pool.query("DELETE FROM debates WHERE status = 'pending'")
     summaryCache.clear()
-    console.log(`clear-and-refetch: deleted ${rowCount} debates, starting pipeline...`)
+    console.log(`clear-and-refetch: deleted ${rowCount} pending debates, starting pipeline...`)
     res.json({ ok: true, deleted: rowCount, message: 'Pipeline started in background' })
-    // Run pipeline in background
     saveIPDebatesFromProtocols(apiKey)
       .then(() => console.log('clear-and-refetch: pipeline done'))
       .catch(e => console.error('clear-and-refetch pipeline error:', e.message))
