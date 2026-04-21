@@ -452,7 +452,7 @@ async function parseVoteDetail(id) {
   const punkt = firstVote.punkt ?? ''
   return {
     title: doc.titel ? `${doc.titel}${punkt ? ` (punkt ${punkt})` : ''}` : (firstVote.beteckning || id),
-    date: (doc.datum ?? firstVote.datum ?? '').slice(0, 10),
+    date: (firstVote.datum ?? doc.datum ?? '').slice(0, 10),
     partyVotes: Object.values(partyMap).filter(p => p.party !== '-').sort((a, b) => b.ja - a.ja),
     dokId: doc.dok_id ?? firstVote.dok_id ?? null,
   }
@@ -958,6 +958,25 @@ app.post('/admin/votes/bulk-fetch', requireAdmin, async (req, res) => {
     }
     console.log('bulk-fetch complete')
   } catch(e) { console.error('bulk-fetch error:', e.message) }
+})
+
+// Fix dates for all existing votes (use firstVote.datum instead of doc.datum)
+app.post('/admin/votes/fix-dates', requireAdmin, async (req, res) => {
+  res.json({ ok: true, message: 'Date fix started in background' })
+  try {
+    const { rows } = await pool.query('SELECT id FROM votes')
+    let fixed = 0
+    for (const row of rows) {
+      try {
+        const detail = await parseVoteDetail(row.id)
+        if (detail.date) {
+          await pool.query('UPDATE votes SET date = $1 WHERE id = $2', [detail.date, row.id])
+          fixed++
+        }
+      } catch(e) { console.error(`fix-dates failed ${row.id}:`, e.message) }
+    }
+    console.log(`fix-dates complete: fixed ${fixed} votes`)
+  } catch(e) { console.error('fix-dates error:', e.message) }
 })
 
 // Bulk-approve all pending votes
