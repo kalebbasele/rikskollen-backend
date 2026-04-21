@@ -915,6 +915,60 @@ app.post('/admin/votes/:id/approve', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+// Bulk-fetch all unique votes from current riksmöte and save as pending
+app.post('/admin/votes/bulk-fetch', requireAdmin, async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  const currentYear = new Date().getFullYear()
+  try {
+    const listRes = await fetchWithTimeout('https://data.riksdagen.se/voteringlista/?rm=2025%2F26&sz=500&utformat=json&gruppering=votering_id&sort=datum&sortorder=desc', 20000)
+    const listData = await listRes.json()
+    const items = listData?.voteringlista?.votering ?? []
+    const arr = Array.isArray(items) ? items : [items]
+    let saved = 0, skipped = 0
+    for (const item of arr) {
+      const vid = item.votering_id
+      if (!vid) continue
+      const existing = await pool.query('SELECT id FROM votes WHERE id = $1', [vid])
+      if (existing.rows.length > 0) { skipped++; continue }
+      let title = item.beteckning || vid
+      let date = (item.datum || '').slice(0, 10)
+      let partyVotes = [], dokId = item.beteckning || null
+      try {
+        const detail = await parseVoteDetail(vid)
+        title = detail.title || title
+        date = detail.date || date
+        partyVotes = detail.partyVotes
+        dokId = item.beteckning || detail.dokId || null
+      } catch(e) { console.error(`bulk-fetch detail failed ${vid}:`, e.message) }
+      if (date && new Date(date).getFullYear() < currentYear) { skipped++; continue }
+      const totalJa = parseInt(item.Ja) || 0
+      const totalNej = parseInt(item.Nej) || 0
+      const baseVote = { id: vid, title, date, totalJa, totalNej, totalAvstar: parseInt(item['Avstår']) || 0, totalFranvarande: parseInt(item['Frånvarande']) || 0, outcome: totalJa >= totalNej ? 'ja' : 'nej', partyVotes, dokId }
+      let humanTitle = null, jaMeaning = null, nejMeaning = null, consequence = null, topicEmoji = null
+      try {
+        const s = await generateVoteSummaryServer(baseVote, apiKey)
+        if (s) { humanTitle = s.humanTitle; jaMeaning = s.jaMeaning; nejMeaning = s.nejMeaning; consequence = s.consequence; topicEmoji = s.topicEmoji }
+      } catch(e) { console.error(`bulk-fetch AI failed ${vid}:`, e.message) }
+      await pool.query(
+        `INSERT INTO votes (id, voter_id, title, human_title, topic_emoji, date, total_ja, total_nej, total_avstar, total_franvarande, party_votes, dok_id, outcome, ja_meaning, nej_meaning, consequence, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending') ON CONFLICT (id) DO NOTHING`,
+        [vid, vid, title, humanTitle, topicEmoji, date, baseVote.totalJa, baseVote.totalNej, baseVote.totalAvstar, baseVote.totalFranvarande, JSON.stringify(partyVotes), dokId, baseVote.outcome, jaMeaning, nejMeaning, consequence]
+      )
+      saved++
+      console.log(`bulk-fetch: saved vote "${title}" (${date})`)
+    }
+    res.json({ ok: true, saved, skipped })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// Bulk-approve all pending votes
+app.post('/admin/votes/approve-all-pending', requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("UPDATE votes SET status = 'approved', approved_at = NOW() WHERE status = 'pending'")
+    res.json({ ok: true, approved: result.rowCount })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 app.delete('/admin/debates/:id', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM debates WHERE id = $1', [req.params.id])
