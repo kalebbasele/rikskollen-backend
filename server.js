@@ -600,17 +600,19 @@ async function runAutoFetch() {
 
   // 2. Votes
   try {
-    const listRes = await fetchWithTimeout('https://data.riksdagen.se/voteringlista/?sz=8&utformat=json&gruppering=votering_id&sort=datum&sortorder=desc')
+    const listRes = await fetchWithTimeout('https://data.riksdagen.se/voteringlista/?rm=2025%2F26&sz=20&utformat=json&gruppering=votering_id&sort=datum&sortorder=desc')
     const listData = await listRes.json()
     const items = listData?.voteringlista?.votering ?? []
-    const arr = (Array.isArray(items) ? items : [items]).slice(0, 6)
+    const arr = (Array.isArray(items) ? items : [items]).slice(0, 10)
 
+    const currentYear = new Date().getFullYear()
     for (const item of arr) {
       const existing = await pool.query('SELECT id FROM votes WHERE id = $1', [item.votering_id])
       if (existing.rows.length > 0) continue
 
       let title = item.beteckning || item.votering_id
       let date = (item.datum || '').slice(0, 10)
+      if (date && new Date(date).getFullYear() < currentYear) continue
       let partyVotes = []
       let dokId = item.beteckning || null
 
@@ -696,7 +698,8 @@ app.get('/api/public/debates', async (req, res) => {
 
 app.get('/api/public/votes', async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM votes WHERE status = 'approved' ORDER BY date DESC")
+    const currentYear = new Date().getFullYear()
+    const { rows } = await pool.query("SELECT * FROM votes WHERE status = 'approved' AND date >= $1 ORDER BY date DESC", [`${currentYear}-01-01`])
     res.json(rows.map(dbVoteToFrontend))
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
@@ -1180,7 +1183,7 @@ async function buildVotesCache() {
   if (votesCache.building) return
   votesCache.building = true
   try {
-    const listRes = await fetchWithTimeout('https://data.riksdagen.se/voteringlista/?sz=8&utformat=json&gruppering=votering_id')
+    const listRes = await fetchWithTimeout('https://data.riksdagen.se/voteringlista/?rm=2025%2F26&sz=8&utformat=json&gruppering=votering_id&sort=datum&sortorder=desc')
     const listData = await listRes.json()
     const items = listData?.voteringlista?.votering ?? []
     const arr = (Array.isArray(items) ? items : [items]).slice(0, 6)
