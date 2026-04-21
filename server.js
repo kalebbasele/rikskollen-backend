@@ -117,8 +117,12 @@ function cleanName(raw) {
     .trim()
 }
 
+const CUSTOM_PHOTOS = {
+  '0397205342021': 'https://web-production-1e2f2.up.railway.app/images/johan-britz.jpg', // Johan Britz
+}
+
 function personPhotoUrl(id) {
-  return `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_max.jpg`
+  return CUSTOM_PHOTOS[id] ?? `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_max.jpg`
 }
 
 function fetchWithTimeout(url, ms = 6000) {
