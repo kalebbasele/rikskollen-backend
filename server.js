@@ -122,7 +122,7 @@ const CUSTOM_PHOTOS = {
 }
 
 function personPhotoUrl(id) {
-  return CUSTOM_PHOTOS[id] ?? `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_max.jpg`
+  return CUSTOM_PHOTOS[id] ?? `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_180.jpg`
 }
 
 function fetchWithTimeout(url, ms = 6000) {
