@@ -915,8 +915,9 @@ app.post('/admin/votes/:id/approve', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
-// Bulk-fetch all unique votes from current riksmöte and save as pending
+// Bulk-fetch all unique votes from current riksmöte — responds immediately, processes in background
 app.post('/admin/votes/bulk-fetch', requireAdmin, async (req, res) => {
+  res.json({ ok: true, message: 'Bulk fetch started in background' })
   const apiKey = process.env.ANTHROPIC_API_KEY
   const currentYear = new Date().getFullYear()
   try {
@@ -924,12 +925,11 @@ app.post('/admin/votes/bulk-fetch', requireAdmin, async (req, res) => {
     const listData = await listRes.json()
     const items = listData?.voteringlista?.votering ?? []
     const arr = Array.isArray(items) ? items : [items]
-    let saved = 0, skipped = 0
     for (const item of arr) {
       const vid = item.votering_id
       if (!vid) continue
       const existing = await pool.query('SELECT id FROM votes WHERE id = $1', [vid])
-      if (existing.rows.length > 0) { skipped++; continue }
+      if (existing.rows.length > 0) continue
       let title = item.beteckning || vid
       let date = (item.datum || '').slice(0, 10)
       let partyVotes = [], dokId = item.beteckning || null
@@ -940,7 +940,7 @@ app.post('/admin/votes/bulk-fetch', requireAdmin, async (req, res) => {
         partyVotes = detail.partyVotes
         dokId = item.beteckning || detail.dokId || null
       } catch(e) { console.error(`bulk-fetch detail failed ${vid}:`, e.message) }
-      if (date && new Date(date).getFullYear() < currentYear) { skipped++; continue }
+      if (date && new Date(date).getFullYear() < currentYear) continue
       const totalJa = parseInt(item.Ja) || 0
       const totalNej = parseInt(item.Nej) || 0
       const baseVote = { id: vid, title, date, totalJa, totalNej, totalAvstar: parseInt(item['Avstår']) || 0, totalFranvarande: parseInt(item['Frånvarande']) || 0, outcome: totalJa >= totalNej ? 'ja' : 'nej', partyVotes, dokId }
@@ -954,11 +954,10 @@ app.post('/admin/votes/bulk-fetch', requireAdmin, async (req, res) => {
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending') ON CONFLICT (id) DO NOTHING`,
         [vid, vid, title, humanTitle, topicEmoji, date, baseVote.totalJa, baseVote.totalNej, baseVote.totalAvstar, baseVote.totalFranvarande, JSON.stringify(partyVotes), dokId, baseVote.outcome, jaMeaning, nejMeaning, consequence]
       )
-      saved++
       console.log(`bulk-fetch: saved vote "${title}" (${date})`)
     }
-    res.json({ ok: true, saved, skipped })
-  } catch(e) { res.status(500).json({ error: e.message }) }
+    console.log('bulk-fetch complete')
+  } catch(e) { console.error('bulk-fetch error:', e.message) }
 })
 
 // Bulk-approve all pending votes
