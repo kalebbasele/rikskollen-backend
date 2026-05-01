@@ -119,10 +119,11 @@ function cleanName(raw) {
 
 const CUSTOM_PHOTOS = {
   '0397205342021': 'https://web-production-1e2f2.up.railway.app/images/johan-britz.jpg', // Johan Britz
+  '0910272619521': 'https://data.riksdagen.se/filarkiv/bilder/ledamot/64a4febc-b5a5-4151-8fd6-5152daf871d7_192.jpg', // Benjamin Dousa (UUID-format)
 }
 
 function personPhotoUrl(id) {
-  return CUSTOM_PHOTOS[id] ?? `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_180.jpg`
+  return CUSTOM_PHOTOS[id] ?? `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_192.jpg`
 }
 
 function fetchWithTimeout(url, ms = 6000) {
@@ -185,12 +186,31 @@ async function fetchIPDocFromAPI(rm, nummer) {
   } catch { return null }
 }
 
+// Resolve the best available photo URL for a person: tries numeric format, falls back to UUID from personlista
+async function resolvePhotoUrl(id) {
+  if (!id) return personPhotoUrl(id)
+  if (CUSTOM_PHOTOS[id]) return CUSTOM_PHOTOS[id]
+  const numericUrl = `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_192.jpg`
+  try {
+    const check = await fetchWithTimeout(numericUrl, 4000)
+    if (check.status === 200) return numericUrl
+  } catch {}
+  // Numeric URL 404 — fetch UUID-based URL from personlista
+  try {
+    const plRes = await fetchWithTimeout(`https://data.riksdagen.se/personlista/?iid=${id}&utformat=json`, 6000)
+    const plData = await plRes.json()
+    const url = plData?.personlista?.person?.bild_url_192
+    if (url) return url
+  } catch {}
+  return numericUrl // fallback even if broken
+}
+
 // Build participants list from IP document's dokintressent
-function buildParticipantsFromIntressenter(dokintressent) {
+async function buildParticipantsFromIntressenter(dokintressent) {
   const intressenter = dokintressent?.intressent ?? []
   const arr = Array.isArray(intressenter) ? intressenter : [intressenter]
   const seen = new Set()
-  const participants = []
+  const deduped = []
   // Prioritize undertecknare (questioner) and besvaradav (minister answering)
   const priority = ['undertecknare', 'besvaradav']
   const sorted = [
@@ -201,20 +221,24 @@ function buildParticipantsFromIntressenter(dokintressent) {
     const id = i.intressent_id || ''
     if (seen.has(id)) continue
     seen.add(id)
+    deduped.push(i)
+  }
+  // Resolve photos in parallel
+  const photoUrls = await Promise.all(deduped.map(i => resolvePhotoUrl(i.intressent_id || '')))
+  return deduped.map((i, idx) => {
     const name = cleanName(i.namn || '')
-    participants.push({
+    return {
       role: i.roll || 'talare',
       person: {
-        id,
+        id: i.intressent_id || '',
         name,
         firstName: name.split(' ')[0] || '',
         lastName: name.split(' ').slice(1).join(' ') || '',
         party: i.partibet || '',
-        photoUrl: personPhotoUrl(id)
+        photoUrl: photoUrls[idx]
       }
-    })
-  }
-  return participants
+    }
+  })
 }
 
 // Fetch speech text for a frågestund from embedded anföranden (reliable — uses dokid not rel_dok_id)
@@ -379,14 +403,14 @@ async function saveIPDebatesFromProtocols(apiKey) {
       const ipNummer = String(ipDoc.nummer || '')
 
       try {
-        const existing = await pool.query('SELECT id, ingress FROM debates WHERE dok_id = $1', [dokId])
-        if (existing.rows.length > 0 && existing.rows[0].ingress) continue // already done
+        const existing = await pool.query('SELECT id, ingress, status FROM debates WHERE dok_id = $1', [dokId])
+        if (existing.rows.length > 0 && (existing.rows[0].ingress || existing.rows[0].status === 'rejected')) continue // already done or intentionally rejected
 
         // Find the matching section
         const section = sections.find(s => s.ipNumbers.includes(ipNummer))
         if (!section) { console.log(`  No protocol section for IP ${ipNummer} (${ipDoc.titel?.slice(0, 40)})`); continue }
 
-        const participants = buildParticipantsFromIntressenter(ipDoc.dokintressent)
+        const participants = await buildParticipantsFromIntressenter(ipDoc.dokintressent)
         if (!participants.length) { console.log(`  No participants for ${dokId}`); continue }
 
         summaryCache.delete(dokId)
@@ -394,8 +418,8 @@ async function saveIPDebatesFromProtocols(apiKey) {
 
         if (!summary) {
           if (existing.rows.length > 0) {
-            await pool.query('DELETE FROM debates WHERE dok_id = $1', [dokId])
-            console.log(`  Deleted ${dokId} — no content`)
+            await pool.query("UPDATE debates SET status = 'rejected' WHERE dok_id = $1", [dokId])
+            console.log(`  Rejected ${dokId} — no content`)
           } else {
             console.log(`  Skipping ${dokId} — no content`)
           }
@@ -538,6 +562,11 @@ async function generateFragstundSummary(dokId, title, date, apiKey) {
 // ── DB mappers ────────────────────────────────────────────────────────────────
 
 function dbDebateToFrontend(row) {
+  // Always recompute photoUrl from person ID so URL format changes apply to existing records
+  const participants = (row.participants || []).map(p => ({
+    ...p,
+    person: { ...p.person, photoUrl: personPhotoUrl(p.person?.id) }
+  }))
   return {
     id: row.id,
     dokId: row.dok_id,
@@ -547,7 +576,7 @@ function dbDebateToFrontend(row) {
     topicEmoji: row.topic_emoji || '',
     date: row.date,
     venue: row.venue,
-    participants: row.participants || [],
+    participants,
     ingress: row.ingress,
     leftBloc: row.left_bloc,
     rightBloc: row.right_bloc,
@@ -588,9 +617,13 @@ function dbFragstundToFrontend(row) {
 
 // ── Auto-fetch job ────────────────────────────────────────────────────────────
 
+let autoFetchRunning = false
+
 async function runAutoFetch() {
+  if (autoFetchRunning) { console.log('Auto-fetch: already running, skipping'); return }
+  autoFetchRunning = true
   const apiKey = process.env.ANTHROPIC_API_KEY
-  if (!apiKey) { console.log('Auto-fetch: no ANTHROPIC_API_KEY, skipping'); return }
+  if (!apiKey) { autoFetchRunning = false; console.log('Auto-fetch: no ANTHROPIC_API_KEY, skipping'); return }
   console.log('Auto-fetch: starting...')
 
   // 1. IP Debates — scan protocols for interpellationsdebatter
@@ -685,6 +718,7 @@ async function runAutoFetch() {
   } catch(e) { console.error('Auto-fetch fragstund error:', e.message) }
 
   console.log('Auto-fetch: done')
+  autoFetchRunning = false
 }
 
 // ── Public endpoints ──────────────────────────────────────────────────────────
@@ -715,7 +749,7 @@ app.get('/api/public/fragstund', async (req, res) => {
 
 app.get('/admin/debates', requireAdmin, async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM debates ORDER BY date DESC, created_at DESC')
+    const { rows } = await pool.query("SELECT * FROM debates WHERE status != 'rejected' ORDER BY date DESC, created_at DESC")
     res.json(rows)
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
@@ -724,6 +758,55 @@ app.get('/admin/votes', requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM votes ORDER BY created_at DESC')
     res.json(rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+// Refresh participant photos: finds any participant whose numeric-ID photo 404s and updates
+// to the UUID-based photo URL from the riksdagen personlista API.
+app.post('/admin/refresh-participant-photos', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT id, participants FROM debates WHERE participants IS NOT NULL AND status != 'rejected'")
+    let updated = 0
+    let checked = 0
+    const uuidCache = {} // intressent_id → uuid photo url
+
+    for (const row of rows) {
+      const participants = row.participants || []
+      let changed = false
+      const updatedParticipants = await Promise.all(participants.map(async p => {
+        const id = p.person?.id
+        if (!id) return p
+        checked++
+        // Check if numeric photo works
+        const numericUrl = `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_192.jpg`
+        try {
+          const check = await fetchWithTimeout(numericUrl, 5000)
+          if (check.status === 200) return p // numeric URL works fine
+        } catch {}
+
+        // Numeric 404 — fetch UUID from personlista
+        if (!uuidCache[id]) {
+          try {
+            const plRes = await fetchWithTimeout(`https://data.riksdagen.se/personlista/?iid=${id}&utformat=json`, 8000)
+            const plData = await plRes.json()
+            const person = plData?.personlista?.person
+            if (person?.bild_url_192) uuidCache[id] = person.bild_url_192
+          } catch {}
+        }
+
+        if (uuidCache[id]) {
+          changed = true
+          return { ...p, person: { ...p.person, photoUrl: uuidCache[id] } }
+        }
+        return p
+      }))
+
+      if (changed) {
+        await pool.query('UPDATE debates SET participants = $1 WHERE id = $2', [JSON.stringify(updatedParticipants), row.id])
+        updated++
+      }
+    }
+    res.json({ ok: true, debatesChecked: rows.length, participantsChecked: checked, debatesUpdated: updated, uuidsCached: Object.keys(uuidCache).length })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
@@ -766,7 +849,7 @@ app.post('/admin/debates/force-save', requireAdmin, async (req, res) => {
     const debateDate = (besvEntry?.datum || '').slice(0, 10)
     if (!debateDate) return res.status(400).json({ error: 'No debate date found in dokaktivitet' })
 
-    const participants = buildParticipantsFromIntressenter(statusData?.dokumentstatus?.dokintressent)
+    const participants = await buildParticipantsFromIntressenter(statusData?.dokumentstatus?.dokintressent)
     if (!participants.length) return res.status(400).json({ error: 'No participants found' })
 
     summaryCache.delete(dokId)
@@ -816,9 +899,9 @@ app.post('/admin/debates/reset-summary', requireAdmin, async (req, res) => {
       )
       res.json({ ok: true, action: 'updated' })
     } else {
-      await pool.query('DELETE FROM debates WHERE id = $1', [row.id])
-      console.log(`reset-summary: deleted "${row.title}" — no debate content`)
-      res.json({ ok: true, action: 'deleted' })
+      await pool.query("UPDATE debates SET status = 'rejected' WHERE id = $1", [row.id])
+      console.log(`reset-summary: rejected "${row.title}" — no debate content`)
+      res.json({ ok: true, action: 'rejected' })
     }
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
@@ -894,8 +977,8 @@ app.post('/admin/debates/:id/reset', requireAdmin, async (req, res) => {
       )
       res.json({ ok: true, title: row.title, date: row.date })
     } else {
-      await pool.query('DELETE FROM debates WHERE id = $1', [row.id])
-      res.json({ ok: true, action: 'deleted', reason: 'no debate content' })
+      await pool.query("UPDATE debates SET status = 'rejected' WHERE id = $1", [row.id])
+      res.json({ ok: true, action: 'rejected', reason: 'no debate content' })
     }
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
@@ -989,7 +1072,8 @@ app.post('/admin/votes/approve-all-pending', requireAdmin, async (req, res) => {
 
 app.delete('/admin/debates/:id', requireAdmin, async (req, res) => {
   try {
-    await pool.query('DELETE FROM debates WHERE id = $1', [req.params.id])
+    // Soft delete: set rejected so auto-fetch won't recreate it
+    await pool.query("UPDATE debates SET status = 'rejected' WHERE id = $1", [req.params.id])
     res.json({ ok: true })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
@@ -1056,8 +1140,8 @@ app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
           )
           updatedDebates++
         } else {
-          await pool.query('DELETE FROM debates WHERE id = $1', [row.id])
-          console.log(`regenerate: deleted "${row.title}" — no debate content`)
+          await pool.query("UPDATE debates SET status = 'rejected' WHERE id = $1", [row.id])
+          console.log(`regenerate: rejected "${row.title}" — no debate content`)
         }
       } catch(e) { console.error(`regenerate debate ${row.id}:`, e.message) }
     }
@@ -1128,8 +1212,8 @@ app.post('/admin/regenerate-all-summaries', requireAdmin, async (req, res) => {
             updated++
             console.log(`regenerate-all: updated ${updated}/${rows.length} — "${row.title}"`)
           } else {
-            await pool.query('DELETE FROM debates WHERE id = $1', [row.id])
-            console.log(`regenerate-all: deleted "${row.title}" — no content`)
+            await pool.query("UPDATE debates SET status = 'rejected' WHERE id = $1", [row.id])
+            console.log(`regenerate-all: rejected "${row.title}" — no content`)
           }
         } catch(e) { console.error(`regenerate-all ${row.id}:`, e.message) }
         await new Promise(r => setTimeout(r, 800)) // rate limit
