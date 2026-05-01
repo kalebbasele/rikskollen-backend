@@ -808,6 +808,45 @@ app.get('/admin/votes', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+// Find and delete duplicate votes (same voter_id or same dok_id).
+// Keeps the best row per group: approved > pending > rejected, then newest created_at.
+app.post('/admin/votes/deduplicate', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT id, voter_id, dok_id, title, status, created_at FROM votes ORDER BY created_at DESC')
+
+    const statusRank = { approved: 0, pending: 1, rejected: 2 }
+    const best = (a, b) => {
+      const ra = statusRank[a.status] ?? 1
+      const rb = statusRank[b.status] ?? 1
+      if (ra !== rb) return ra < rb ? a : b
+      return new Date(a.created_at) > new Date(b.created_at) ? a : b
+    }
+
+    // Group by voter_id first, then by dok_id for rows without voter_id
+    const groups = {}
+    for (const row of rows) {
+      const key = row.voter_id || row.dok_id || row.id
+      if (!groups[key]) groups[key] = []
+      groups[key].push(row)
+    }
+
+    const toDelete = []
+    for (const group of Object.values(groups)) {
+      if (group.length < 2) continue
+      let keeper = group[0]
+      for (const row of group.slice(1)) keeper = best(keeper, row)
+      for (const row of group) {
+        if (row.id !== keeper.id) toDelete.push(row.id)
+      }
+    }
+
+    if (toDelete.length === 0) return res.json({ deleted: 0, message: 'Inga dubletter hittades' })
+
+    await pool.query(`DELETE FROM votes WHERE id = ANY($1)`, [toDelete])
+    res.json({ deleted: toDelete.length, ids: toDelete })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 // Pre-warm the photo cache: downloads and stores all unique participant photos in PostgreSQL.
 // Run once after deploy so photos are instantly available without depending on riksdagen.se.
 app.post('/admin/prewarm-photo-cache', requireAdmin, async (req, res) => {
