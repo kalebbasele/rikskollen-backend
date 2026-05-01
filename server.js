@@ -84,6 +84,12 @@ async function initDb() {
       value JSONB,
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS person_photos (
+      id TEXT PRIMARY KEY,
+      photo_data BYTEA NOT NULL,
+      content_type TEXT DEFAULT 'image/jpeg',
+      cached_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `)
   console.log('DB: tables ready')
 }
@@ -117,13 +123,17 @@ function cleanName(raw) {
     .trim()
 }
 
+const BACKEND_URL = 'https://web-production-1e2f2.up.railway.app'
+
+// Only for people with manually uploaded photos (not in riksdagen's system at all)
 const CUSTOM_PHOTOS = {
-  '0397205342021': 'https://web-production-1e2f2.up.railway.app/images/johan-britz.jpg', // Johan Britz
-  '0910272619521': 'https://data.riksdagen.se/filarkiv/bilder/ledamot/64a4febc-b5a5-4151-8fd6-5152daf871d7_192.jpg', // Benjamin Dousa (UUID-format)
+  '0397205342021': `${BACKEND_URL}/images/johan-britz.jpg`, // Johan Britz — manually uploaded
 }
 
+// Returns our own photo proxy URL — photos are downloaded once and stored in PostgreSQL
 function personPhotoUrl(id) {
-  return CUSTOM_PHOTOS[id] ?? `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_192.jpg`
+  if (!id) return ''
+  return CUSTOM_PHOTOS[id] ?? `${BACKEND_URL}/photos/${id}`
 }
 
 function fetchWithTimeout(url, ms = 6000) {
@@ -186,31 +196,30 @@ async function fetchIPDocFromAPI(rm, nummer) {
   } catch { return null }
 }
 
-// Resolve the best available photo URL for a person: tries numeric format, falls back to UUID from personlista
-async function resolvePhotoUrl(id) {
-  if (!id) return personPhotoUrl(id)
-  if (CUSTOM_PHOTOS[id]) return CUSTOM_PHOTOS[id]
+// Find the best riksdagen photo URL for a person — used internally by the /photos/:id proxy
+// Tries numeric _192.jpg first (works for most), falls back to UUID from personlista API
+async function resolveRiksdagenPhotoUrl(id) {
   const numericUrl = `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_192.jpg`
   try {
-    const check = await fetchWithTimeout(numericUrl, 4000)
-    if (check.status === 200) return numericUrl
+    const check = await fetch(numericUrl, { method: 'HEAD', signal: AbortSignal.timeout(4000) })
+    if (check.ok) return numericUrl
   } catch {}
-  // Numeric URL 404 — fetch UUID-based URL from personlista
+  // Numeric URL failed — fetch UUID-based URL from personlista
   try {
     const plRes = await fetchWithTimeout(`https://data.riksdagen.se/personlista/?iid=${id}&utformat=json`, 6000)
     const plData = await plRes.json()
     const url = plData?.personlista?.person?.bild_url_192
     if (url) return url
   } catch {}
-  return numericUrl // fallback even if broken
+  return numericUrl // last resort fallback
 }
 
 // Build participants list from IP document's dokintressent
-async function buildParticipantsFromIntressenter(dokintressent) {
+function buildParticipantsFromIntressenter(dokintressent) {
   const intressenter = dokintressent?.intressent ?? []
   const arr = Array.isArray(intressenter) ? intressenter : [intressenter]
   const seen = new Set()
-  const deduped = []
+  const participants = []
   // Prioritize undertecknare (questioner) and besvaradav (minister answering)
   const priority = ['undertecknare', 'besvaradav']
   const sorted = [
@@ -221,24 +230,20 @@ async function buildParticipantsFromIntressenter(dokintressent) {
     const id = i.intressent_id || ''
     if (seen.has(id)) continue
     seen.add(id)
-    deduped.push(i)
-  }
-  // Resolve photos in parallel
-  const photoUrls = await Promise.all(deduped.map(i => resolvePhotoUrl(i.intressent_id || '')))
-  return deduped.map((i, idx) => {
     const name = cleanName(i.namn || '')
-    return {
+    participants.push({
       role: i.roll || 'talare',
       person: {
-        id: i.intressent_id || '',
+        id,
         name,
         firstName: name.split(' ')[0] || '',
         lastName: name.split(' ').slice(1).join(' ') || '',
         party: i.partibet || '',
-        photoUrl: photoUrls[idx]
+        photoUrl: personPhotoUrl(id) // points to our proxy — downloaded on first view
       }
-    }
-  })
+    })
+  }
+  return participants
 }
 
 // Fetch speech text for a frågestund from embedded anföranden (reliable — uses dokid not rel_dok_id)
@@ -410,7 +415,7 @@ async function saveIPDebatesFromProtocols(apiKey) {
         const section = sections.find(s => s.ipNumbers.includes(ipNummer))
         if (!section) { console.log(`  No protocol section for IP ${ipNummer} (${ipDoc.titel?.slice(0, 40)})`); continue }
 
-        const participants = await buildParticipantsFromIntressenter(ipDoc.dokintressent)
+        const participants = buildParticipantsFromIntressenter(ipDoc.dokintressent)
         if (!participants.length) { console.log(`  No participants for ${dokId}`); continue }
 
         summaryCache.delete(dokId)
@@ -721,6 +726,47 @@ async function runAutoFetch() {
   autoFetchRunning = false
 }
 
+// ── Photo proxy ───────────────────────────────────────────────────────────────
+// Downloads each person's photo once from riksdagen, stores in PostgreSQL, serves forever.
+// This means photos never depend on riksdagen.se being up or changing URL formats.
+
+app.get('/photos/:id', async (req, res) => {
+  const id = req.params.id
+  if (!id || !/^[\w\-]+$/.test(id)) return res.status(400).send('Invalid id')
+
+  try {
+    // Serve from PostgreSQL cache if available
+    const cached = await pool.query('SELECT photo_data, content_type FROM person_photos WHERE id = $1', [id])
+    if (cached.rows.length > 0) {
+      res.set('Content-Type', cached.rows[0].content_type)
+      res.set('Cache-Control', 'public, max-age=604800') // 1 week browser cache
+      return res.send(cached.rows[0].photo_data)
+    }
+
+    // Not cached — find the real riksdagen URL and download
+    const photoUrl = await resolveRiksdagenPhotoUrl(id)
+    const photoRes = await fetchWithTimeout(photoUrl, 12000)
+    if (!photoRes.ok) return res.status(404).send('Photo not found')
+
+    const buffer = Buffer.from(await photoRes.arrayBuffer())
+    const contentType = photoRes.headers.get('content-type') || 'image/jpeg'
+
+    // Store permanently in PostgreSQL
+    await pool.query(
+      'INSERT INTO person_photos (id, photo_data, content_type) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING',
+      [id, buffer, contentType]
+    )
+    console.log(`Photo cached: ${id} (${buffer.length} bytes)`)
+
+    res.set('Content-Type', contentType)
+    res.set('Cache-Control', 'public, max-age=604800')
+    res.send(buffer)
+  } catch(e) {
+    console.error(`Photo proxy error for ${id}:`, e.message)
+    res.status(502).send('Photo unavailable')
+  }
+})
+
 // ── Public endpoints ──────────────────────────────────────────────────────────
 
 app.get('/api/public/debates', async (req, res) => {
@@ -761,53 +807,43 @@ app.get('/admin/votes', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
-// Refresh participant photos: finds any participant whose numeric-ID photo 404s and updates
-// to the UUID-based photo URL from the riksdagen personlista API.
-app.post('/admin/refresh-participant-photos', requireAdmin, async (req, res) => {
+// Pre-warm the photo cache: downloads and stores all unique participant photos in PostgreSQL.
+// Run once after deploy so photos are instantly available without depending on riksdagen.se.
+app.post('/admin/prewarm-photo-cache', requireAdmin, async (req, res) => {
+  res.json({ ok: true, message: 'Photo pre-warm started in background' })
   try {
-    const { rows } = await pool.query("SELECT id, participants FROM debates WHERE participants IS NOT NULL AND status != 'rejected'")
-    let updated = 0
-    let checked = 0
-    const uuidCache = {} // intressent_id → uuid photo url
-
+    const { rows } = await pool.query("SELECT participants FROM debates WHERE participants IS NOT NULL AND status != 'rejected'")
+    const ids = new Set()
     for (const row of rows) {
-      const participants = row.participants || []
-      let changed = false
-      const updatedParticipants = await Promise.all(participants.map(async p => {
+      for (const p of (row.participants || [])) {
         const id = p.person?.id
-        if (!id) return p
-        checked++
-        // Check if numeric photo works
-        const numericUrl = `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_192.jpg`
-        try {
-          const check = await fetchWithTimeout(numericUrl, 5000)
-          if (check.status === 200) return p // numeric URL works fine
-        } catch {}
-
-        // Numeric 404 — fetch UUID from personlista
-        if (!uuidCache[id]) {
-          try {
-            const plRes = await fetchWithTimeout(`https://data.riksdagen.se/personlista/?iid=${id}&utformat=json`, 8000)
-            const plData = await plRes.json()
-            const person = plData?.personlista?.person
-            if (person?.bild_url_192) uuidCache[id] = person.bild_url_192
-          } catch {}
-        }
-
-        if (uuidCache[id]) {
-          changed = true
-          return { ...p, person: { ...p.person, photoUrl: uuidCache[id] } }
-        }
-        return p
-      }))
-
-      if (changed) {
-        await pool.query('UPDATE debates SET participants = $1 WHERE id = $2', [JSON.stringify(updatedParticipants), row.id])
-        updated++
+        if (id && !CUSTOM_PHOTOS[id]) ids.add(id)
       }
     }
-    res.json({ ok: true, debatesChecked: rows.length, participantsChecked: checked, debatesUpdated: updated, uuidsCached: Object.keys(uuidCache).length })
-  } catch(e) { res.status(500).json({ error: e.message }) }
+    // Check which are already cached
+    const { rows: cached } = await pool.query('SELECT id FROM person_photos')
+    for (const r of cached) ids.delete(r.id)
+
+    console.log(`Photo pre-warm: ${ids.size} photos to download`)
+    let done = 0
+    for (const id of ids) {
+      try {
+        const photoUrl = await resolveRiksdagenPhotoUrl(id)
+        const photoRes = await fetchWithTimeout(photoUrl, 12000)
+        if (!photoRes.ok) { console.log(`  Photo 404: ${id}`); continue }
+        const buffer = Buffer.from(await photoRes.arrayBuffer())
+        const contentType = photoRes.headers.get('content-type') || 'image/jpeg'
+        await pool.query(
+          'INSERT INTO person_photos (id, photo_data, content_type) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING',
+          [id, buffer, contentType]
+        )
+        done++
+        console.log(`  Cached photo ${done}: ${id} (${buffer.length}B)`)
+        await new Promise(r => setTimeout(r, 200)) // rate limit
+      } catch(e) { console.error(`  Photo error ${id}:`, e.message) }
+    }
+    console.log(`Photo pre-warm done: ${done}/${ids.size} downloaded`)
+  } catch(e) { console.error('Photo pre-warm error:', e.message) }
 })
 
 app.post('/admin/fix-vote-dokids', requireAdmin, async (req, res) => {
@@ -849,7 +885,7 @@ app.post('/admin/debates/force-save', requireAdmin, async (req, res) => {
     const debateDate = (besvEntry?.datum || '').slice(0, 10)
     if (!debateDate) return res.status(400).json({ error: 'No debate date found in dokaktivitet' })
 
-    const participants = await buildParticipantsFromIntressenter(statusData?.dokumentstatus?.dokintressent)
+    const participants = buildParticipantsFromIntressenter(statusData?.dokumentstatus?.dokintressent)
     if (!participants.length) return res.status(400).json({ error: 'No participants found' })
 
     summaryCache.delete(dokId)
