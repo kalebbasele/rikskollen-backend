@@ -129,6 +129,7 @@ const BACKEND_URL = 'https://web-production-1e2f2.up.railway.app'
 const CUSTOM_PHOTOS = {
   '0397205342021': `${BACKEND_URL}/images/johan-britz.jpg`,    // Johan Britz — manually uploaded
   '0910272619521': `${BACKEND_URL}/images/benjamin-dousa.jpg`, // Benjamin Dousa — manually uploaded
+  '0125036219125': `${BACKEND_URL}/images/nina-larsson.jpg`,  // Nina Larsson — manually uploaded
 }
 
 // Returns our own photo proxy URL — photos are downloaded once and stored in PostgreSQL
