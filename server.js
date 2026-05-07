@@ -490,7 +490,7 @@ async function parseVoteDetail(id) {
 
 async function generateVoteSummaryServer(vote, apiKey) {
   const partyBreakdown = (vote.partyVotes || []).map(pv => `${pv.party}: ${pv.ja} ja, ${pv.nej} nej`).join('\n')
-  const prompt = `Du är en politisk redaktör som förklarar riksdagsbeslut sakligt och tillgängligt för unga svenska väljare.
+  const prompt = `Du är en politisk journalist som förklarar riksdagsbeslut på klarspråk för vanliga svenska medborgare. Inga krångliga ord, inga abstraktioner.
 
 Omröstning: ${vote.title}
 Datum: ${vote.date}
@@ -499,15 +499,15 @@ Resultat: ${vote.totalJa} ja, ${vote.totalNej} nej → ${vote.outcome === 'ja' ?
 Partier:
 ${partyBreakdown}
 
-De fyra fälten ska vara tydligt olika från varandra och inte upprepa samma information:
+Fyll i fyra fält. Varje fält ska vara KONKRET och SPECIFIKT – berätta exakt vad som faktiskt förändras eller inte, för riktiga människor i vardagen. Inga ord som "förslaget", "motionen", "bereds", "riksdagen beslutade att". Skriv direkt.
 
-humanTitle: En kort, engagerande fråga (max 8 ord) som fångar kärnan i vad omröstningen gällde.
+humanTitle: En skarp rubrik som en journalist hade skrivit – max 8 ord. Ska avslöja vad saken faktiskt handlar om.
 
-jaMeaning: Beskriv konkret vad en JA-röst stödde – den faktiska policyn eller förändringen, inte bara "förslaget godkänns". En mening.
+jaMeaning: Vad JA-sidan röstade FÖR – beskriv den konkreta förändringen eller lagen som stöddes. Nämn vad som faktiskt ändras i praktiken. En mening, max 20 ord.
 
-nejMeaning: Beskriv vad en NEJ-röst stödde – vad som hade bevarats eller vilket alternativ man föredrog. Får INTE vara en spegelbild av jaMeaning med "avslås" inbytt. En mening.
+nejMeaning: Vad NEJ-sidan föredrog istället – inte bara "röstade mot" utan vad de ville bevara eller göra annorlunda. En mening, max 20 ord. INTE en spegling av jaMeaning.
 
-consequence: Vad utfallet faktiskt innebär framåt för vanliga människor – konkret och framåtblickande. Ska tillföra ny information som inte redan finns i jaMeaning eller nejMeaning. Börja inte med "Det innebär att" eller "Riksdagen beslutade". 1–2 meningar.
+consequence: Vad händer nu i praktiken? Beskriv den verkliga effekten för medborgare, företag eller samhälle. Var specifik – vad förändras konkret från och med nu? 1–2 meningar, max 35 ord.
 
 Svara ENDAST med JSON:
 {"humanTitle":"...","jaMeaning":"...","nejMeaning":"...","consequence":"...","topicEmoji":"[ett relevant emoji]"}`
@@ -1082,6 +1082,29 @@ app.post('/admin/votes/:id/unapprove', requireAdmin, async (req, res) => {
 })
 
 // Bulk-fetch all unique votes from current riksmöte — responds immediately, processes in background
+app.post('/admin/votes/regenerate-summaries', requireAdmin, async (req, res) => {
+  res.json({ ok: true, message: 'Regenerating summaries in background' })
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  if (!apiKey) return
+  try {
+    const { rows } = await pool.query("SELECT * FROM votes WHERE status = 'approved' ORDER BY date DESC")
+    for (const row of rows) {
+      try {
+        const baseVote = { title: row.title, date: row.date, totalJa: row.total_ja, totalNej: row.total_nej, outcome: row.outcome, partyVotes: row.party_votes || [] }
+        const s = await generateVoteSummaryServer(baseVote, apiKey)
+        if (s) {
+          await pool.query(
+            'UPDATE votes SET human_title=$1, ja_meaning=$2, nej_meaning=$3, consequence=$4, topic_emoji=$5 WHERE id=$6',
+            [s.humanTitle, s.jaMeaning, s.nejMeaning, s.consequence, s.topicEmoji, row.id]
+          )
+          console.log(`regenerated summary for "${row.title}"`)
+        }
+      } catch(e) { console.error(`regen failed ${row.id}:`, e.message) }
+    }
+    console.log('regenerate-summaries complete')
+  } catch(e) { console.error('regenerate-summaries error:', e.message) }
+})
+
 app.post('/admin/votes/bulk-fetch', requireAdmin, async (req, res) => {
   res.json({ ok: true, message: 'Bulk fetch started in background' })
   const apiKey = process.env.ANTHROPIC_API_KEY
