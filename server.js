@@ -501,7 +501,7 @@ ${partyBreakdown}
 
 Fyll i fyra fält. Varje fält ska vara KONKRET och SPECIFIKT – berätta exakt vad som faktiskt förändras eller inte, för riktiga människor i vardagen. Inga ord som "förslaget", "motionen", "bereds", "riksdagen beslutade att". Skriv direkt.
 
-humanTitle: En skarp rubrik som en journalist hade skrivit – max 8 ord. Ska avslöja vad saken faktiskt handlar om.
+humanTitle: En kort, engagerande fråga (max 8 ord) som fångar kärnan i vad omröstningen gällde.
 
 jaMeaning: Vad JA-sidan röstade FÖR – beskriv den konkreta förändringen eller lagen som stöddes. Nämn vad som faktiskt ändras i praktiken. En mening, max 20 ord.
 
