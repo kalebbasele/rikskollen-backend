@@ -1074,6 +1074,13 @@ app.post('/admin/votes/:id/approve', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+app.post('/admin/votes/:id/unapprove', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("UPDATE votes SET status = 'pending', approved_at = NULL WHERE id = $1", [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 // Bulk-fetch all unique votes from current riksmöte — responds immediately, processes in background
 app.post('/admin/votes/bulk-fetch', requireAdmin, async (req, res) => {
   res.json({ ok: true, message: 'Bulk fetch started in background' })
