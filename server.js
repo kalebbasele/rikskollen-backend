@@ -1191,6 +1191,15 @@ app.delete('/admin/votes/:id', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+app.post('/admin/votes/delete-old-pending', requireAdmin, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      "DELETE FROM votes WHERE status = 'pending' AND date <= '2026-04-22'"
+    )
+    res.json({ deleted: rowCount })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 app.get('/admin/fragstund', requireAdmin, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM fragstund ORDER BY created_at DESC')
