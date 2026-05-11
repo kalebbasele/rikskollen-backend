@@ -490,7 +490,7 @@ async function parseVoteDetail(id) {
 
 async function generateVoteSummaryServer(vote, apiKey) {
   const partyBreakdown = (vote.partyVotes || []).map(pv => `${pv.party}: ${pv.ja} ja, ${pv.nej} nej`).join('\n')
-  const prompt = `Du är en politisk journalist som förklarar riksdagsbeslut på klarspråk för vanliga svenska medborgare. Inga krångliga ord, inga abstraktioner.
+  const prompt = `Du är en erfaren svensk politisk journalist. Du skriver korrekt, flytande svenska för en bred publik. Inga engelska ord, inga direktöversättningar, inga byråkratiska fraser.
 
 Omröstning: ${vote.title}
 Datum: ${vote.date}
@@ -499,15 +499,22 @@ Resultat: ${vote.totalJa} ja, ${vote.totalNej} nej → ${vote.outcome === 'ja' ?
 Partier:
 ${partyBreakdown}
 
-Fyll i fyra fält. Varje fält ska vara KONKRET och SPECIFIKT – berätta exakt vad som faktiskt förändras eller inte, för riktiga människor i vardagen. Inga ord som "förslaget", "motionen", "bereds", "riksdagen beslutade att". Skriv direkt.
+Fyll i fyra fält på korrekt svenska. Varje fält ska vara konkret och specifikt för just denna omröstning.
 
-humanTitle: En kort, engagerande fråga (max 8 ord) som fångar kärnan i vad omröstningen gällde.
+REGLER:
+- Skriv alltid på korrekt, naturlig svenska – som en van journalist, inte en robot
+- Undvik: "förslaget", "motionen", "bereds vidare", "riksdagen beslutade att", "implementeras"
+- Undvik engelska lånord när det finns ett bra svenskt alternativ
+- Varje mening ska handla om just DENNA omröstning – inga generiska formuleringar
+- humanTitle ska vara en fråga som väcker nyfikenhet, max 8 ord
 
-jaMeaning: Vad JA-sidan röstade FÖR – beskriv den konkreta förändringen eller lagen som stöddes. Nämn vad som faktiskt ändras i praktiken. En mening, max 20 ord.
+humanTitle: En engagerande fråga som fångar kärnan. Exempel: "Ska a-kassan höjas för deltidsarbetande?" eller "Får kommuner sälja ut LSS-boenden?"
 
-nejMeaning: Vad NEJ-sidan föredrog istället – inte bara "röstade mot" utan vad de ville bevara eller göra annorlunda. En mening, max 20 ord. INTE en spegling av jaMeaning.
+jaMeaning: Vad JA innebar i praktiken – den konkreta förändring eller det beslut som stöddes. En mening, max 20 ord.
 
-consequence: Vad händer nu i praktiken? Beskriv den verkliga effekten för medborgare, företag eller samhälle. Var specifik – vad förändras konkret från och med nu? 1–2 meningar, max 35 ord.
+nejMeaning: Vad NEJ innebar – vad de som röstade nej ville i stället, eller vad som bevaras. En mening, max 20 ord. Ska INTE vara en spegelbild av jaMeaning.
+
+consequence: Vad händer nu konkret? Beskriv den verkliga effekten för medborgare, kommuner eller samhälle. 1–2 meningar, max 35 ord.
 
 Svara ENDAST med JSON:
 {"humanTitle":"...","jaMeaning":"...","nejMeaning":"...","consequence":"...","topicEmoji":"[ett relevant emoji]"}`
@@ -515,7 +522,7 @@ Svara ENDAST med JSON:
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 400, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 500, messages: [{ role: 'user', content: prompt }] })
   })
   const data = await res.json()
   const text = data.content?.[0]?.text ?? ''
