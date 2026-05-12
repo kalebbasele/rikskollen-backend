@@ -158,8 +158,8 @@ function extractIPSections(protText) {
   let m
   while ((m = pattern.exec(protText)) !== null) {
     const after = protText.slice(m.index, m.index + 600)
-    // Require actual speech content (colon after speaker name) — not just a TOC listing
-    if (!/Anf\.\s*\d+[^:\n]{0,100}:/i.test(after)) continue
+    // Require actual speech content ("talman" = speaker address) — not just a TOC listing
+    if (!/talman/i.test(after)) continue
     const ipNumbers = []
     const rmPattern = /\d{4}\/\d{2}:(\d+)/g
     let rm2
