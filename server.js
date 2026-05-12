@@ -158,7 +158,8 @@ function extractIPSections(protText) {
   let m
   while ((m = pattern.exec(protText)) !== null) {
     const after = protText.slice(m.index, m.index + 600)
-    if (!/Anf\./i.test(after)) continue
+    // Require actual speech content (colon after speaker name) — not just a TOC listing
+    if (!/Anf\.\s*\d+[^:\n]{0,100}:/i.test(after)) continue
     const ipNumbers = []
     const rmPattern = /\d{4}\/\d{2}:(\d+)/g
     let rm2
@@ -325,6 +326,8 @@ async function generateAndCache(dokId, title, date, apiKey, debateText = '') {
   const aiData = await aiRes.json()
   const text = (aiData.content?.[0]?.text ?? '').replace(/```json|```/g, '').trim()
   if (text === 'null' || text === '') return null
+  // If Claude returned explanatory text instead of JSON (e.g. mismatch between title and content), treat as null
+  if (!text.startsWith('{')) return null
   const result = JSON.parse(text)
   summaryCache.set(dokId, result)
   return result
