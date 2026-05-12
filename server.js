@@ -1060,7 +1060,7 @@ app.post('/admin/debates/:id/reset', requireAdmin, async (req, res) => {
       const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
       const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
       await pool.query(
-        'UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE id = $4',
+        "UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3, status = CASE WHEN status = 'rejected' THEN 'pending' ELSE status END WHERE id = $4",
         [summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), row.id]
       )
       res.json({ ok: true, title: row.title, date: row.date })
@@ -1497,8 +1497,7 @@ app.get('/summary/:dokId', async (req, res) => {
   if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
   try {
     const debateText = await fetchIPSectionForDebate(req.params.dokId, req.query.date || '', req.query.title || req.params.dokId)
-    if (req.query.debug) return res.json({ sectionLength: debateText?.length ?? 0, start: debateText?.slice(0, 400) ?? '', mid: debateText?.slice(1800, 2200) ?? '' })
-    const result = await generateAndCache(req.params.dokId, req.query.title || req.params.dokId, req.query.date || '', apiKey, debateText)
+const result = await generateAndCache(req.params.dokId, req.query.title || req.params.dokId, req.query.date || '', apiKey, debateText)
     if (!result) return res.status(500).json({ error: 'Could not generate' })
     res.json({ dok_id: req.params.dokId, ...result })
   } catch(e) { res.status(500).json({ error: e.message }) }
