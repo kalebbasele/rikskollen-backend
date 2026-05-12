@@ -274,7 +274,7 @@ async function fetchFragstundText(dokId) {
 // Find the protocol section for a specific IP debate (used by reset-summary)
 async function fetchIPSectionForDebate(dokId, date, title) {
   try {
-    const dateStr = (date || '').replace(/-/g, '')
+    const dateStr = (date || '').slice(0, 10) // Keep YYYY-MM-DD format — riksdagen API requires dashes
     if (!dateStr) return ''
     // Extract IP nummer from dok_id (e.g. HD10356 → 356, HD01KU31 → no match → '')
     const nummerMatch = dokId.match(/^[A-Z]+\d{2}(\d+)$/i)
