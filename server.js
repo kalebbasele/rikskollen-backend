@@ -1497,7 +1497,7 @@ app.get('/summary/:dokId', async (req, res) => {
   if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
   try {
     const debateText = await fetchIPSectionForDebate(req.params.dokId, req.query.date || '', req.query.title || req.params.dokId)
-    if (req.query.debug) return res.json({ sectionLength: debateText?.length ?? 0, preview: debateText?.slice(1800, 2300) ?? '' })
+    if (req.query.debug) return res.json({ sectionLength: debateText?.length ?? 0, start: debateText?.slice(0, 400) ?? '', mid: debateText?.slice(1800, 2200) ?? '' })
     const result = await generateAndCache(req.params.dokId, req.query.title || req.params.dokId, req.query.date || '', apiKey, debateText)
     if (!result) return res.status(500).json({ error: 'Could not generate' })
     res.json({ dok_id: req.params.dokId, ...result })
