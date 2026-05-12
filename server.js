@@ -134,7 +134,7 @@ const CUSTOM_PHOTOS = {
 // Returns our own photo proxy URL — photos are downloaded once and stored in PostgreSQL
 function personPhotoUrl(id) {
   if (!id) return ''
-  return CUSTOM_PHOTOS[id] ?? `${BACKEND_URL}/photos/${id}`
+  return `${BACKEND_URL}/photos/${id}`
 }
 
 function fetchWithTimeout(url, ms = 6000) {
@@ -751,8 +751,8 @@ app.get('/photos/:id', async (req, res) => {
       return res.send(cached.rows[0].photo_data)
     }
 
-    // Not cached — find the real riksdagen URL and download
-    const photoUrl = await resolveRiksdagenPhotoUrl(id)
+    // Not cached — check custom photos first, then riksdagen
+    const photoUrl = CUSTOM_PHOTOS[id] ?? await resolveRiksdagenPhotoUrl(id)
     const photoRes = await fetchWithTimeout(photoUrl, 12000)
     if (!photoRes.ok) return res.status(404).send('Photo not found')
 
