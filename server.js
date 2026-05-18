@@ -465,6 +465,163 @@ async function saveIPDebatesFromProtocols(apiKey) {
   console.log('saveIPDebatesFromProtocols: done')
 }
 
+// ── Betänkande pipeline ────────────────────────────────────────────────────────
+
+function extractBetSections(protText) {
+  const debatePositions = []
+  const pattern = /betänkande \d{4}\/\d{2}:([A-Z][a-zA-Z]*\d+)/g
+  let m
+  while ((m = pattern.exec(protText)) !== null) {
+    const after = protText.slice(m.index, m.index + 600)
+    // Require actual speech: "): Fru/Herr talman" — rules out TOC entries and "ingen talare" cases
+    if (!/\)\s*:\s*(?:Fru|Herr) talman/i.test(after)) continue
+    debatePositions.push({ index: m.index, beteckning: m[1] })
+  }
+  const sections = []
+  for (let i = 0; i < debatePositions.length; i++) {
+    const { index, beteckning } = debatePositions[i]
+    const start = Math.max(0, index - 300)
+    const nextStart = i + 1 < debatePositions.length ? debatePositions[i + 1].index : index + 25000
+    const end = Math.min(nextStart, index + 20000)
+    sections.push({ beteckning, sectionText: protText.slice(start, end) })
+  }
+  return sections
+}
+
+function parseBetParticipants(sectionText) {
+  const seen = new Map()
+  const anf = /Anf\. \d+ (.+?) \(([A-ZÅÄÖ]{1,5})\)\s*:\s*(?:Fru|Herr) talman/g
+  let m
+  while ((m = anf.exec(sectionText)) !== null) {
+    const rawName = m[1].trim()
+    const party = m[2]
+    if (seen.has(rawName)) continue
+    seen.set(rawName, party)
+  }
+  return Array.from(seen.entries()).map(([rawName, party]) => {
+    // Convert ALL CAPS to Title Case, strip minister prefixes (contain lowercase letters)
+    const name = /^[A-ZÅÄÖÜ\-\s]+$/.test(rawName)
+      ? rawName.toLowerCase().replace(/\b\w/g, c => c.toUpperCase())
+      : rawName // keep as-is if mixed case (minister title included)
+    const parts = name.split(/\s+/)
+    return {
+      role: 'talare',
+      person: { id: '', name, firstName: parts[0] || '', lastName: parts.slice(1).join(' ') || '', party, photoUrl: '' }
+    }
+  })
+}
+
+async function fetchBetSectionForDebate(dokId, date) {
+  try {
+    if (!date) return ''
+    const betMatch = dokId.match(/^HD\d{2}(.+)$/i)
+    const beteckning = betMatch?.[1] ?? ''
+    if (!beteckning) return ''
+    const protRes = await fetchWithTimeout(
+      `https://data.riksdagen.se/dokumentlista/?doktyp=prot&from=${date}&tom=${date}&utformat=json&antal=5`,
+      10000
+    )
+    const protData = await protRes.json()
+    const prots = protData?.dokumentlista?.dokument ?? []
+    const protArr = Array.isArray(prots) ? prots : [prots]
+    for (const prot of protArr.filter(p => p?.dok_id)) {
+      const textRes = await fetchWithTimeout(`https://data.riksdagen.se/dokument/${prot.dok_id}.text`, 15000)
+      const raw = await textRes.text()
+      const protText = stripTags(raw)
+      const sections = extractBetSections(protText)
+      const section = sections.find(s => s.beteckning.toLowerCase() === beteckning.toLowerCase())
+      if (section) return section.sectionText
+    }
+  } catch (e) { console.error('fetchBetSectionForDebate error:', e.message) }
+  return ''
+}
+
+async function saveBetDebatesFromProtocols(apiKey) {
+  const rm = '2025/26'
+  const CUTOFF = '2026-05-06'
+  console.log('saveBetDebatesFromProtocols: starting')
+
+  // Build date → protocol map for dates >= CUTOFF
+  const protDateMap = new Map()
+  for (let page = 1; page <= 5; page++) {
+    try {
+      const res = await fetchWithTimeout(
+        `https://data.riksdagen.se/dokumentlista/?doktyp=prot&rm=${encodeURIComponent(rm)}&utformat=json&antal=50&sort=datum&sortorder=desc&p=${page}`,
+        12000
+      )
+      const data = await res.json()
+      const docs = data?.dokumentlista?.dokument ?? []
+      const arr = Array.isArray(docs) ? docs : [docs]
+      if (!arr.length || !arr[0]?.dok_id) break
+      let reachedCutoff = false
+      for (const p of arr) {
+        if (p?.dok_id && p.datum) {
+          const date = p.datum.slice(0, 10)
+          if (date < CUTOFF) { reachedCutoff = true; break }
+          protDateMap.set(date, p.dok_id)
+        }
+      }
+      if (reachedCutoff) break
+    } catch (e) { console.error(`Bet protocol page ${page} failed:`, e.message); break }
+  }
+  console.log(`saveBetDebatesFromProtocols: ${protDateMap.size} protocols since ${CUTOFF}`)
+
+  for (const [date, protDokId] of protDateMap) {
+    let protText = ''
+    try {
+      const textRes = await fetchWithTimeout(`https://data.riksdagen.se/dokument/${protDokId}.text`, 15000)
+      const raw = await textRes.text()
+      protText = stripTags(raw)
+    } catch (e) { console.error(`Protocol fetch failed for ${date}:`, e.message); continue }
+
+    const sections = extractBetSections(protText)
+    if (!sections.length) continue
+    console.log(`  ${date}: ${sections.length} bet sections with actual debate`)
+
+    for (const section of sections) {
+      const dokId = `HD01${section.beteckning}`
+      try {
+        const existing = await pool.query('SELECT id, ingress, status FROM debates WHERE dok_id = $1', [dokId])
+        if (existing.rows.length > 0 && (existing.rows[0].ingress || existing.rows[0].status === 'rejected')) continue
+
+        const docRes = await fetchWithTimeout(`https://data.riksdagen.se/dokumentstatus/${dokId}.json`, 8000)
+        const docData = await docRes.json()
+        const titel = docData?.dokumentstatus?.dokument?.titel
+        if (!titel) { console.log(`  Could not find doc ${dokId}`); continue }
+
+        summaryCache.delete(dokId)
+        const summary = await generateAndCache(dokId, titel, date, apiKey, section.sectionText)
+
+        if (!summary) {
+          if (existing.rows.length > 0) await pool.query("UPDATE debates SET status = 'rejected' WHERE dok_id = $1", [dokId])
+          console.log(`  Skipping ${dokId} — no content`)
+          continue
+        }
+
+        const participants = parseBetParticipants(section.sectionText)
+        const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
+        const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
+
+        if (existing.rows.length > 0) {
+          await pool.query('UPDATE debates SET ingress = $1, left_bloc = $2, right_bloc = $3 WHERE dok_id = $4',
+            [summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc), dokId])
+          console.log(`  Updated "${titel.slice(0, 50)}"`)
+        } else {
+          await pool.query(
+            `INSERT INTO debates (id, dok_id, dok_type, title, topic, topic_emoji, date, venue, participants, ingress, left_bloc, right_bloc, status)
+             VALUES ($1,$2,'bet',$3,'Debatt om förslag','',$4,'Riksdagens kammare',$5,$6,$7,$8,'pending')
+             ON CONFLICT (id) DO NOTHING`,
+            [dokId, dokId, titel, date, JSON.stringify(participants), summary.ingress, JSON.stringify(leftBloc), JSON.stringify(rightBloc)]
+          )
+          console.log(`  Saved "${titel.slice(0, 50)}" (${date})`)
+        }
+        await new Promise(r => setTimeout(r, 400))
+      } catch (e) { console.error(`  Error processing ${dokId}:`, e.message) }
+    }
+  }
+  console.log('saveBetDebatesFromProtocols: done')
+}
+
 // ── Vote helpers ──────────────────────────────────────────────────────────────
 
 async function parseVoteDetail(id) {
@@ -647,7 +804,12 @@ async function runAutoFetch() {
   // 1. IP Debates — scan protocols for interpellationsdebatter
   try {
     await saveIPDebatesFromProtocols(apiKey)
-  } catch(e) { console.error('Auto-fetch debates error:', e.message) }
+  } catch(e) { console.error('Auto-fetch IP debates error:', e.message) }
+
+  // 2. Bet Debates — scan protocols for betänkandedebatter (from 2026-05-06)
+  try {
+    await saveBetDebatesFromProtocols(apiKey)
+  } catch(e) { console.error('Auto-fetch bet debates error:', e.message) }
 
   // 2. Votes
   try {
@@ -1048,11 +1210,13 @@ app.post('/admin/debates/:id/reset', requireAdmin, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY
   try {
     summaryCache.delete(dokId)
-    const { rows } = await pool.query('SELECT id, dok_id, title, date FROM debates WHERE dok_id = $1', [dokId])
+    const { rows } = await pool.query('SELECT id, dok_id, title, date, dok_type FROM debates WHERE dok_id = $1', [dokId])
     if (rows.length === 0) return res.status(404).json({ error: 'Debate not found' })
     const row = rows[0]
 
-    const debateText = await fetchIPSectionForDebate(row.dok_id, row.date, row.title)
+    const debateText = row.dok_type === 'bet'
+      ? await fetchBetSectionForDebate(row.dok_id, row.date)
+      : await fetchIPSectionForDebate(row.dok_id, row.date, row.title)
     if (!debateText) return res.status(404).json({ error: 'No protocol section found' })
 
     const summary = await generateAndCache(row.dok_id, row.title, row.date, apiKey, debateText)
@@ -1243,6 +1407,13 @@ app.delete('/admin/fragstund/:id', requireAdmin, async (req, res) => {
     await pool.query('DELETE FROM fragstund WHERE id = $1', [req.params.id])
     res.json({ ok: true })
   } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/admin/bet/fetch', requireAdmin, async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
+  res.json({ ok: true, message: 'Betänkandedebatter hämtas i bakgrunden…' })
+  saveBetDebatesFromProtocols(apiKey).catch(e => console.error('saveBetDebatesFromProtocols error:', e.message))
 })
 
 app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
