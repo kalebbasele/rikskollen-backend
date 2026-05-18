@@ -501,7 +501,7 @@ function parseBetParticipants(sectionText) {
   return Array.from(seen.entries()).map(([rawName, party]) => {
     // Convert ALL CAPS to Title Case
     const name = /^[A-ZÅÄÖÜ\-\s]+$/.test(rawName)
-      ? rawName.toLowerCase().replace(/\b\w/g, c => c.toUpperCase())
+      ? rawName.toLowerCase().replace(/(?:^|\s|-)\w/g, c => c.toUpperCase())
       : rawName
     const parts = name.split(/\s+/)
     return {
