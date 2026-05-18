@@ -499,16 +499,46 @@ function parseBetParticipants(sectionText) {
     seen.set(rawName, party)
   }
   return Array.from(seen.entries()).map(([rawName, party]) => {
-    // Convert ALL CAPS to Title Case, strip minister prefixes (contain lowercase letters)
+    // Convert ALL CAPS to Title Case
     const name = /^[A-ZÅÄÖÜ\-\s]+$/.test(rawName)
       ? rawName.toLowerCase().replace(/\b\w/g, c => c.toUpperCase())
-      : rawName // keep as-is if mixed case (minister title included)
+      : rawName
     const parts = name.split(/\s+/)
     return {
       role: 'talare',
       person: { id: '', name, firstName: parts[0] || '', lastName: parts.slice(1).join(' ') || '', party, photoUrl: '' }
     }
   })
+}
+
+// Look up a riksdag member's intressent_id by first + last name
+const personIdCache = new Map()
+async function lookupPersonId(firstName, lastName) {
+  const key = `${firstName}|${lastName}`
+  if (personIdCache.has(key)) return personIdCache.get(key)
+  try {
+    const res = await fetchWithTimeout(
+      `https://data.riksdagen.se/personlista/?fnamn=${encodeURIComponent(firstName)}&enamn=${encodeURIComponent(lastName)}&utformat=json&rdlstatus=samtliga`,
+      6000
+    )
+    const data = await res.json()
+    const persons = data?.personlista?.person ?? []
+    const arr = Array.isArray(persons) ? persons : [persons]
+    const id = arr[0]?.intressent_id ?? ''
+    personIdCache.set(key, id)
+    return id
+  } catch { return '' }
+}
+
+async function enrichBetParticipants(participants) {
+  return Promise.all(participants.map(async p => {
+    if (p.person.id) return p // already has ID
+    const id = await lookupPersonId(p.person.firstName, p.person.lastName)
+    return {
+      ...p,
+      person: { ...p.person, id, photoUrl: id ? personPhotoUrl(id) : '' }
+    }
+  }))
 }
 
 async function fetchBetSectionForDebate(dokId, date) {
@@ -598,7 +628,7 @@ async function saveBetDebatesFromProtocols(apiKey) {
           continue
         }
 
-        const participants = parseBetParticipants(section.sectionText)
+        const participants = await enrichBetParticipants(parseBetParticipants(section.sectionText))
         const leftBloc = { parties: summary.vansterblocket?.parties ?? [], summary: summary.vansterblocket?.summary ?? '', keyArg: summary.vansterblocket?.keyArg ?? '' }
         const rightBloc = { parties: summary.hogerblocket?.parties ?? [], summary: summary.hogerblocket?.summary ?? '', keyArg: summary.hogerblocket?.keyArg ?? '' }
 
@@ -1414,6 +1444,23 @@ app.post('/admin/bet/fetch', requireAdmin, async (req, res) => {
   if (!apiKey) return res.status(400).json({ error: 'No ANTHROPIC_API_KEY' })
   res.json({ ok: true, message: 'Betänkandedebatter hämtas i bakgrunden…' })
   saveBetDebatesFromProtocols(apiKey).catch(e => console.error('saveBetDebatesFromProtocols error:', e.message))
+})
+
+// Re-enrich participants for existing bet debates that have empty person IDs
+app.post('/admin/bet/enrich-participants', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT id, participants FROM debates WHERE dok_type = 'bet' AND participants IS NOT NULL")
+    let updated = 0
+    for (const row of rows) {
+      const participants = Array.isArray(row.participants) ? row.participants : []
+      const needsEnrich = participants.some(p => !p.person?.id)
+      if (!needsEnrich) continue
+      const enriched = await enrichBetParticipants(participants)
+      await pool.query('UPDATE debates SET participants = $1 WHERE id = $2', [JSON.stringify(enriched), row.id])
+      updated++
+    }
+    res.json({ ok: true, updated })
+  } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
 app.post('/admin/regenerate-summaries', requireAdmin, async (req, res) => {
