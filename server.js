@@ -702,9 +702,9 @@ REGLER:
 
 humanTitle: En engagerande fråga som fångar kärnan. Exempel: "Ska a-kassan höjas för deltidsarbetande?" eller "Får kommuner sälja ut LSS-boenden?"
 
-jaMeaning: Vad JA innebar i praktiken – den konkreta förändring eller det beslut som stöddes. En mening, max 20 ord.
+jaMeaning: Vad ett JA-röst innebar i praktiken – beskriv konkret vad som händer eller förändras om förslaget går igenom. Förklara enkelt för någon som inte följer politik. 2–3 meningar, max 50 ord. Nämn INTE partier eller politiska block.
 
-nejMeaning: Vad NEJ innebar – vad de som röstade nej ville i stället, eller vad som bevaras. En mening, max 20 ord. Ska INTE vara en spegelbild av jaMeaning.
+nejMeaning: Vad ett NEJ-röst innebar i praktiken – beskriv konkret vad det betyder att förslaget avslås, vad som bevaras eller inte förändras. Förklara enkelt för någon som inte följer politik. 2–3 meningar, max 50 ord. Nämn INTE partier eller politiska block.
 
 consequence: Vad händer nu konkret? Beskriv den verkliga effekten för medborgare, kommuner eller samhälle. 1–2 meningar, max 35 ord.
 
