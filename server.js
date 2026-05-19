@@ -1293,7 +1293,7 @@ app.post('/admin/votes/regenerate-summaries', requireAdmin, async (req, res) => 
   const apiKey = process.env.ANTHROPIC_API_KEY
   if (!apiKey) return
   try {
-    const { rows } = await pool.query("SELECT * FROM votes WHERE status = 'approved' ORDER BY date DESC")
+    const { rows } = await pool.query("SELECT * FROM votes WHERE status = 'pending' ORDER BY date DESC")
     for (const row of rows) {
       try {
         const baseVote = { title: row.title, date: row.date, totalJa: row.total_ja, totalNej: row.total_nej, outcome: row.outcome, partyVotes: row.party_votes || [] }
