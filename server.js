@@ -203,19 +203,19 @@ async function fetchIPDocFromAPI(rm, nummer) {
 // Find the best riksdagen photo URL for a person — used internally by the /photos/:id proxy
 // Tries numeric _192.jpg first (works for most), falls back to UUID from personlista API
 async function resolveRiksdagenPhotoUrl(id) {
-  const numericUrl = `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_192.jpg`
+  const maxUrl = `https://data.riksdagen.se/filarkiv/bilder/ledamot/${id}_max.jpg`
   try {
-    const check = await fetch(numericUrl, { method: 'HEAD', signal: AbortSignal.timeout(4000) })
-    if (check.ok) return numericUrl
+    const check = await fetch(maxUrl, { method: 'HEAD', signal: AbortSignal.timeout(4000) })
+    if (check.ok) return maxUrl
   } catch {}
-  // Numeric URL failed — fetch UUID-based URL from personlista
+  // Max URL failed — fetch UUID-based URL from personlista
   try {
     const plRes = await fetchWithTimeout(`https://data.riksdagen.se/personlista/?iid=${id}&utformat=json`, 6000)
     const plData = await plRes.json()
     const url = plData?.personlista?.person?.bild_url_192
     if (url) return url
   } catch {}
-  return numericUrl // last resort fallback
+  return maxUrl // last resort fallback
 }
 
 // Build participants list from IP document's dokintressent
@@ -970,6 +970,17 @@ app.get('/photos/:id', async (req, res) => {
     console.error(`Photo proxy error for ${id}:`, e.message)
     res.status(502).send('Photo unavailable')
   }
+})
+
+// Clear photo cache so all photos are re-fetched at higher quality
+app.post('/admin/photos/clear-cache', requireAdmin, async (req, res) => {
+  const keepIds = Object.keys(CUSTOM_PHOTOS) // preserve manually uploaded photos
+  const placeholders = keepIds.map((_, i) => `$${i + 1}`).join(',')
+  const query = keepIds.length > 0
+    ? `DELETE FROM person_photos WHERE id NOT IN (${placeholders})`
+    : `DELETE FROM person_photos`
+  const result = await pool.query(query, keepIds)
+  res.json({ ok: true, deleted: result.rowCount })
 })
 
 // ── Public endpoints ──────────────────────────────────────────────────────────
