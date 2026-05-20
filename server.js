@@ -137,7 +137,7 @@ const CUSTOM_PHOTOS = {
 // Returns our own photo proxy URL — photos are downloaded once and stored in PostgreSQL
 function personPhotoUrl(id) {
   if (!id) return ''
-  return `${BACKEND_URL}/photos/${id}`
+  return `${BACKEND_URL}/photos/${id}?v=2`
 }
 
 function fetchWithTimeout(url, ms = 6000) {
