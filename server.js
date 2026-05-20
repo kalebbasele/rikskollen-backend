@@ -57,6 +57,7 @@ async function initDb() {
     );
     ALTER TABLE votes ADD COLUMN IF NOT EXISTS voter_id TEXT;
     ALTER TABLE debates ADD COLUMN IF NOT EXISTS dok_type TEXT DEFAULT 'ip';
+    ALTER TABLE debates ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS fragstund (
       id TEXT PRIMARY KEY,
       dok_id TEXT UNIQUE,
@@ -987,7 +988,7 @@ app.post('/admin/photos/clear-cache', requireAdmin, async (req, res) => {
 
 app.get('/api/public/debates', async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM debates WHERE status = 'approved' ORDER BY date DESC")
+    const { rows } = await pool.query("SELECT * FROM debates WHERE status = 'approved' ORDER BY pinned DESC, date DESC")
     res.json(rows.map(dbDebateToFrontend))
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
@@ -1241,6 +1242,15 @@ app.patch('/admin/votes/:id', requireAdmin, async (req, res) => {
 app.post('/admin/debates/:id/approve', requireAdmin, async (req, res) => {
   try {
     await pool.query("UPDATE debates SET status = 'approved', approved_at = NOW() WHERE id = $1", [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/admin/debates/:id/pin', requireAdmin, async (req, res) => {
+  const { pinned } = req.body
+  try {
+    if (pinned) await pool.query('UPDATE debates SET pinned = FALSE') // unpin all first
+    await pool.query('UPDATE debates SET pinned = $1 WHERE id = $2', [!!pinned, req.params.id])
     res.json({ ok: true })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
