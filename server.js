@@ -137,7 +137,7 @@ const CUSTOM_PHOTOS = {
 // Returns our own photo proxy URL — photos are downloaded once and stored in PostgreSQL
 function personPhotoUrl(id) {
   if (!id) return ''
-  return `${BACKEND_URL}/photos/${id}?v=2`
+  return `${BACKEND_URL}/photos/${id}?v=3`
 }
 
 function fetchWithTimeout(url, ms = 6000) {
@@ -213,7 +213,7 @@ async function resolveRiksdagenPhotoUrl(id) {
   try {
     const plRes = await fetchWithTimeout(`https://data.riksdagen.se/personlista/?iid=${id}&utformat=json`, 6000)
     const plData = await plRes.json()
-    const url = plData?.personlista?.person?.bild_url_192
+    const url = plData?.personlista?.person?.bild_url_max ?? plData?.personlista?.person?.bild_url_192
     if (url) return url
   } catch {}
   return maxUrl // last resort fallback
