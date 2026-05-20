@@ -2,6 +2,7 @@ import express from 'express'
 import cors from 'cors'
 import fetch from 'node-fetch'
 import pg from 'pg'
+import sharp from 'sharp'
 
 const { Pool } = pg
 const app = express()
@@ -137,7 +138,7 @@ const CUSTOM_PHOTOS = {
 // Returns our own photo proxy URL — photos are downloaded once and stored in PostgreSQL
 function personPhotoUrl(id) {
   if (!id) return ''
-  return `${BACKEND_URL}/photos/${id}?v=3`
+  return `${BACKEND_URL}/photos/${id}?v=4`
 }
 
 function fetchWithTimeout(url, ms = 6000) {
@@ -954,15 +955,24 @@ app.get('/photos/:id', async (req, res) => {
     const photoRes = await fetchWithTimeout(photoUrl, 12000)
     if (!photoRes.ok) return res.status(404).send('Photo not found')
 
-    const buffer = Buffer.from(await photoRes.arrayBuffer())
-    const contentType = photoRes.headers.get('content-type') || 'image/jpeg'
+    const rawBuffer = Buffer.from(await photoRes.arrayBuffer())
+
+    // Resize to 400px wide, 85% JPEG quality — crisp but fast to load
+    let buffer, contentType
+    try {
+      buffer = await sharp(rawBuffer).resize({ width: 400, withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer()
+      contentType = 'image/jpeg'
+    } catch {
+      buffer = rawBuffer
+      contentType = photoRes.headers.get('content-type') || 'image/jpeg'
+    }
 
     // Store permanently in PostgreSQL
     await pool.query(
       'INSERT INTO person_photos (id, photo_data, content_type) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING',
       [id, buffer, contentType]
     )
-    console.log(`Photo cached: ${id} (${buffer.length} bytes)`)
+    console.log(`Photo cached: ${id} (${rawBuffer.length} → ${buffer.length} bytes)`)
 
     res.set('Content-Type', contentType)
     res.set('Cache-Control', 'public, max-age=604800')
