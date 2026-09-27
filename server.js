@@ -92,6 +92,15 @@ async function initDb() {
       content_type TEXT DEFAULT 'image/jpeg',
       cached_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS presskonferenser (
+      id TEXT PRIMARY KEY,
+      dok_id TEXT,
+      title TEXT NOT NULL,
+      date TIMESTAMPTZ,
+      summary TEXT,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `)
   console.log('DB: tables ready')
 }
@@ -1790,6 +1799,74 @@ app.get('/debug/db', requireAdmin, async (req, res) => {
 })
 
 // ── Startup ───────────────────────────────────────────────────────────────────
+
+// ── Presskonferenser ──────────────────────────────────────────────────────────
+
+app.get('/api/public/presskonferenser', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT * FROM presskonferenser WHERE status = 'approved' ORDER BY date DESC"
+    )
+    res.json(rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/admin/presskonferenser', requireAdmin, async (_req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM presskonferenser ORDER BY date DESC")
+    res.json(rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/admin/presskonferenser', requireAdmin, async (req, res) => {
+  const { id, dok_id, title, date, summary } = req.body
+  try {
+    await pool.query(
+      `INSERT INTO presskonferenser (id, dok_id, title, date, summary)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (id) DO UPDATE SET title=$3, date=$4, summary=$5`,
+      [id, dok_id || null, title, date, summary || null]
+    )
+    const { rows } = await pool.query('SELECT * FROM presskonferenser WHERE id = $1', [id])
+    res.json(rows[0])
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.patch('/admin/presskonferenser/:id', requireAdmin, async (req, res) => {
+  const { title, summary } = req.body
+  try {
+    await pool.query(
+      `UPDATE presskonferenser SET
+        title = COALESCE($1, title),
+        summary = COALESCE($2, summary)
+       WHERE id = $3`,
+      [title ?? null, summary ?? null, req.params.id]
+    )
+    const { rows } = await pool.query('SELECT * FROM presskonferenser WHERE id = $1', [req.params.id])
+    res.json(rows[0])
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/admin/presskonferenser/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("UPDATE presskonferenser SET status = 'approved' WHERE id = $1", [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.post('/admin/presskonferenser/:id/unapprove', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("UPDATE presskonferenser SET status = 'pending' WHERE id = $1", [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
+app.delete('/admin/presskonferenser/:id', requireAdmin, async (req, res) => {
+  try {
+    await pool.query("DELETE FROM presskonferenser WHERE id = $1", [req.params.id])
+    res.json({ ok: true })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
 
 let dbReady = false
 
