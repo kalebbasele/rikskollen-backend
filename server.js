@@ -1027,6 +1027,15 @@ app.get('/api/public/fragstund', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+app.get('/api/public/presskonferenser', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT * FROM presskonferenser WHERE status = 'approved' ORDER BY date DESC"
+    )
+    res.json(rows)
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
+
 // ── Admin endpoints ───────────────────────────────────────────────────────────
 
 app.get('/admin/debates', requireAdmin, async (req, res) => {
@@ -1801,15 +1810,6 @@ app.get('/debug/db', requireAdmin, async (req, res) => {
 // ── Startup ───────────────────────────────────────────────────────────────────
 
 // ── Presskonferenser ──────────────────────────────────────────────────────────
-
-app.get('/api/public/presskonferenser', async (_req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "SELECT * FROM presskonferenser WHERE status = 'approved' ORDER BY date DESC"
-    )
-    res.json(rows)
-  } catch(e) { res.status(500).json({ error: e.message }) }
-})
 
 app.get('/admin/presskonferenser', requireAdmin, async (_req, res) => {
   try {
