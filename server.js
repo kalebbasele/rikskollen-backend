@@ -98,9 +98,13 @@ async function initDb() {
       title TEXT NOT NULL,
       date TIMESTAMPTZ,
       summary TEXT,
+      url TEXT,
+      image_url TEXT,
       status TEXT DEFAULT 'pending',
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    ALTER TABLE presskonferenser ADD COLUMN IF NOT EXISTS url TEXT;
+    ALTER TABLE presskonferenser ADD COLUMN IF NOT EXISTS image_url TEXT;
   `)
   console.log('DB: tables ready')
 }
@@ -1819,13 +1823,13 @@ app.get('/admin/presskonferenser', requireAdmin, async (_req, res) => {
 })
 
 app.post('/admin/presskonferenser', requireAdmin, async (req, res) => {
-  const { id, dok_id, title, date, summary } = req.body
+  const { id, dok_id, title, date, summary, url, image_url } = req.body
   try {
     await pool.query(
-      `INSERT INTO presskonferenser (id, dok_id, title, date, summary)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (id) DO UPDATE SET title=$3, date=$4, summary=$5`,
-      [id, dok_id || null, title, date, summary || null]
+      `INSERT INTO presskonferenser (id, dok_id, title, date, summary, url, image_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (id) DO UPDATE SET title=$3, date=$4, summary=$5, url=$6, image_url=$7`,
+      [id, dok_id || null, title, date, summary || null, url || null, image_url || null]
     )
     const { rows } = await pool.query('SELECT * FROM presskonferenser WHERE id = $1', [id])
     res.json(rows[0])
@@ -1833,14 +1837,16 @@ app.post('/admin/presskonferenser', requireAdmin, async (req, res) => {
 })
 
 app.patch('/admin/presskonferenser/:id', requireAdmin, async (req, res) => {
-  const { title, summary } = req.body
+  const { title, summary, url, image_url } = req.body
   try {
     await pool.query(
       `UPDATE presskonferenser SET
         title = COALESCE($1, title),
-        summary = COALESCE($2, summary)
-       WHERE id = $3`,
-      [title ?? null, summary ?? null, req.params.id]
+        summary = COALESCE($2, summary),
+        url = COALESCE($3, url),
+        image_url = COALESCE($4, image_url)
+       WHERE id = $5`,
+      [title ?? null, summary ?? null, url ?? null, image_url ?? null, req.params.id]
     )
     const { rows } = await pool.query('SELECT * FROM presskonferenser WHERE id = $1', [req.params.id])
     res.json(rows[0])
