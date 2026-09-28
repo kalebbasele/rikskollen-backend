@@ -1034,7 +1034,7 @@ app.get('/api/public/fragstund', async (req, res) => {
 app.get('/api/public/presskonferenser', async (_req, res) => {
   try {
     const { rows } = await pool.query(
-      "SELECT * FROM presskonferenser WHERE status = 'approved' ORDER BY date DESC"
+      "SELECT * FROM presskonferenser WHERE status = 'approved' ORDER BY date DESC LIMIT 1"
     )
     res.json(rows)
   } catch(e) { res.status(500).json({ error: e.message }) }
