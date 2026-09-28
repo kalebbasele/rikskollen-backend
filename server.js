@@ -1874,6 +1874,74 @@ app.delete('/admin/presskonferenser/:id', requireAdmin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+async function runAutoFetchPresskonferenser() {
+  console.log('Auto-fetch presskonferenser: starting...')
+  try {
+    const res = await fetchWithTimeout(
+      'https://data.riksdagen.se/dokumentlista/?doktyp=sam-pk&utformat=json&antal=10&sort=datum&sortorder=desc',
+      10000
+    )
+    const data = await res.json()
+    const docs = data?.dokumentlista?.dokument ?? []
+    const arr = (Array.isArray(docs) ? docs : [docs]).filter(Boolean)
+
+    for (const doc of arr) {
+      const dokId = doc.dok_id
+      if (!dokId) continue
+
+      const existing = await pool.query('SELECT id FROM presskonferenser WHERE dok_id = $1', [dokId])
+      if (existing.rows.length > 0) continue
+
+      const date = doc.datum ? new Date(doc.datum) : new Date()
+      const title = stripTags(doc.titel || doc.notis || '').trim() || 'Pressträff'
+
+      // Fetch summary from document text
+      let summary = ''
+      try {
+        const statusRes = await fetchWithTimeout(
+          `https://data.riksdagen.se/dokumentstatus/${dokId}.json`,
+          10000
+        )
+        const statusData = await statusRes.json()
+        const text = statusData?.dokumentstatus?.dokument?.text ?? ''
+        const clean = stripTags(text).replace(/\s+/g, ' ').trim()
+        if (clean) summary = clean.slice(0, 400).trimEnd() + (clean.length > 400 ? '...' : '')
+      } catch(e) { /* no summary */ }
+
+      // Check if posterframe exists
+      let imageUrl = null
+      try {
+        const imgRes = await fetchWithTimeout(
+          `https://mhdownload.riksdagen.se/posterframes/${dokId}.jpg`,
+          6000
+        )
+        if (imgRes.ok) imageUrl = `https://mhdownload.riksdagen.se/posterframes/${dokId}.jpg`
+      } catch(e) { /* no image */ }
+
+      // Construct webb-tv URL
+      const slug = (doc.titel || '')
+        .toLowerCase()
+        .replace(/å/g, 'a').replace(/ä/g, 'a').replace(/ö/g, 'o')
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '')
+      const url = slug
+        ? `https://www.riksdagen.se/sv/webb-tv/video/presskonferens/${slug}_${dokId}/`
+        : null
+
+      const id = `${dokId}`
+      await pool.query(
+        `INSERT INTO presskonferenser (id, dok_id, title, date, summary, url, image_url, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'approved')
+         ON CONFLICT (id) DO NOTHING`,
+        [id, dokId, title, date, summary || null, url, imageUrl]
+      )
+      console.log(`Auto-fetch presskonferenser: added "${title}" (${dokId})`)
+    }
+  } catch(e) {
+    console.error('Auto-fetch presskonferenser error:', e.message)
+  }
+}
+
 let dbReady = false
 
 async function start() {
@@ -1886,7 +1954,9 @@ async function start() {
     dbReady = true
     buildVotesCache()
     runAutoFetch()
+    runAutoFetchPresskonferenser()
     setInterval(runAutoFetch, 60 * 60 * 1000)
+    setInterval(runAutoFetchPresskonferenser, 60 * 60 * 1000)
   } catch(e) {
     console.error('DB not available, running without CMS:', e.message)
   }
